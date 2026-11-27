@@ -1,0 +1,23 @@
+# Architectural Decisions & Known Trade-offs
+
+## What We Built
+- **Durable Inbound & Outbound Storage (MongoDB)**: Unique compound indexes on `(workspaceId, messageId)` for inbound messages and `(workspaceId, clientRef)` for outbound replies guarantee idempotency across duplicate webhooks, concurrent retries, and crashes. Inbound messages store `occurred_at` as `sortOrder` so out-of-order arrivals render in chronological order.
+- **Crash & Failover Recovery (`kill -9` + Multi-Instance)**: Outbound replies are persisted to MongoDB (`status: "queued"`) before returning `202`. A polling background worker leases jobs using atomic `findOneAndUpdate` with a 25-second `lockExpiresAt` lease, passes `Idempotency-Key: <client_ref>` to Pigeon, and retries transient `503`s or 12-second timeouts with exponential backoff. If an instance dies mid-flight, another instance reclaims expired leases within 25 seconds.
+- **Atomic Claiming**: `claimConversation` performs an atomic `findOneAndUpdate` matching `assignee: { $in: [null, agent] }`, returning `200` to the winner (and idempotent re-claims) and `409` to concurrent contenders.
+- **OIDC PKCE + Tenant Isolation**: Implemented Authorization Code + `S256` PKCE against `:4020`, storing short-lived verifiers in Redis and signing session payloads (`sub`, `workspaces`) into an HTTP-only HMAC-SHA256 cookie. Every REST route and WebSocket upgrade verifies workspace membership (`401` unauthenticated, `403` wrong workspace).
+- **Real-Time Fan-Out & Replay**: Workspace events increment a Redis counter (`switchboard:seq:<workspace>`), persist to an `events` collection, and publish over Redis Pub/Sub so clients connected to any server replica receive updates and can catch up via `GET /ws?workspace=<id>&after=<seq>`.
+
+## What We Cut & Why
+- **E2EE Private Notes (`PROTOCOL.md`), Elasticsearch Search, and Paybox Billing**: Cut to prioritize correctness and resilience on the core inbox, crash recovery, multi-instance failover, and OIDC/WebSocket isolation (`70.8 / 75` automated score in `CHECK_REPORT.json`).
+- **Pre-compiled JS Build Step**: Kept `tsx src/index.ts` as the `start` command in `switchboard.json` for rapid iteration within the 2-hour window.
+
+## Assumptions Where the Brief Is Silent
+- **Session Storage**: Sessions are stateless HMAC-signed HTTP-only cookies derived from `GRADER_TOKEN` and `OIDC_CLIENT_SECRET` so sessions remain valid across `kill -9` restarts and multiple server replicas without requiring sticky load balancing.
+- **Status Precedence**: Outbound status transitions are ranked (`failed: 0 < queued: 1 < sent: 2 < delivered: 3`) so out-of-order status webhooks (e.g., `delivered` arriving before `sent`) never regress a message's final state.
+- **Unknown Workspaces & Event Types**: Per `PIGEON.md`, validly signed webhooks for unknown workspaces, unknown event types, or unknown `client_ref` status updates return `200` and are ignored so Pigeon does not retry them.
+
+## What Is Still Wrong / Known Issues
+1. **Cross-Instance `Retry-After` Window (`multi_retry_after`: 0/3 in Level 3)**: When multiple server instances run concurrently under burst load, two workers can lease jobs simultaneously right before one receives a `429 Retry-After` response and writes the shared `switchboard:pigeon_cooldown:<workspace>` key in Redis—resulting in requests slipping through inside the `Retry-After` window. A centralized Redis token-bucket Lua script that checks both the cooldown key and token count atomically at send time would eliminate this race.
+2. **Concurrent WebSocket `seq` Ordering (`socket_live`: 2/3 in Level 5)**: Because `publishWorkspaceEvent` increments `seq` in Redis before awaiting the MongoDB `insertOne` and `redis.publish`, two concurrent events on separate instances (or async completions on one instance) can publish to Redis Pub/Sub out of `seq` order, causing `seq` on the client socket to occasionally appear non-monotonic. Serializing publishes per workspace and buffering/reordering frames by `seq` before sending on the WebSocket would fix this.
+3. **Final Status Tail Latency on Crash/Failover (`crash_sends_status` 11/12 & `failover_status` 11/12)**: When a worker times out at 5.5 s on a 12-second slow Pigeon response right before a crash/failover, the final `delivered` status webhook can occasionally land just after the harness snapshot window closes.
+4. **Windows/MINGW64 Process Group Teardown**: Running `npm run check` repeatedly on Windows/Git Bash can leave child `tsx`/`node` processes bound to `:4001`/`:4002` after `SIGKILL` on the wrapper shell unless lingering listeners are terminated or `node` is invoked directly without `npm`/`tsx` wrappers.

@@ -1,0 +1,3320 @@
+Need to build this assignment in the next hour, i am attaching the instructions and a;ready provided files, build the full codebase
+
+I don't have local shell or file-writing access to your machine here, so I can't modify your repo directly—but I can give you a complete, copy-pasteable production implementation for `scaffold/server` and `scaffold/web` plus a tight 2-hour sprint checklist so you can drop it in and run `npm run check` right away.
+
+One quick heads-up before you code: **read `PIGEON.md` first** to confirm the exact HMAC/signature header name, signing string format, and Pigeon's outbound `POST /v1/messages` request/response schema. In the snippets below, the webhook signature check and Pigeon send payload are clearly marked so you can plug in `PIGEON.md`'s exact header/field names without guessing.
+
+---
+
+### 1. 2-Hour Sprint Plan (Strict Pacing)
+
+* **0:00 – 0:10:** Read `PIGEON.md`, run `npm run up && npm run doctor && npm run scaffold:install`, and commit `"starter"`.
+* **0:10 – 0:35:** Drop in the server code below, wire the exact `PIGEON.md` signature + `/v1/messages` details, and test `GET /healthz`.
+* **0:35 – 0:55:** Stop your dev server and run `npm run check` (Level 1). Fix any webhook ordering/dedup/claim/retry bugs before moving on.
+* **0:55 – 1:15:** Verify OIDC PKCE (`/auth/login`, `/auth/callback`, `/api/me`), workspace `403` isolation, and `/ws?workspace=...&after=...`. Run `npm run check -- --levels 5`.
+* **1:15 – 1:35:** Drop in the React inbox UI (`scaffold/web/src/App.tsx`), test login, claiming, replying, and live WebSocket updates, and run `npm run check:full` (Levels 1, 2, 3, 5).
+* **1:35 – 1:50:** Handle Level 4 edge cases from `PIGEON.md` (bad signatures, malformed payloads, unknown workspaces, status ordering) and add `README.md` + `DECISIONS.md`.
+* **1:50 – 2:00:** Export AI transcripts to `ai-logs/`, run one final `npm run check:full`, commit every 15 mins / before push, make the repo public, and submit the commit hash.
+
+---
+
+### 2. Server Architecture (`scaffold/server`)
+
+Make sure `switchboard.json` starts this server (for example, `tsc` build + `node dist/index.js` or `tsx src/index.ts`, with `PORT` and all env vars from `.env.example` read dynamically—never hardcoded).
+
+#### `scaffold/server/src/config.ts`
+
+```ts
+import crypto from "crypto";
+
+export const config = {
+  port: Number(process.env.PORT || 4000),
+  publicUrl: process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 4000}`,
+  frontendUrl: process.env.FRONTEND_URL || "http://localhost:5173",
+  mongoUrl: process.env.MONGO_URL || "mongodb://localhost:27017/switchboard",
+  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  pigeonUrl: (process.env.PIGEON_URL || "http://localhost:4010").replace(/\/+$/, ""),
+  pigeonWebhookSecret: process.env.PIGEON_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || "",
+  idpUrl: (process.env.IDP_URL || process.env.OIDC_ISSUER || "http://localhost:4020").replace(/\/+$/, ""),
+  idpClientId: process.env.IDP_CLIENT_ID || process.env.OIDC_CLIENT_ID || "switchboard-web",
+  graderToken: process.env.GRADER_TOKEN || "",
+  sessionSecret:
+    process.env.SESSION_SECRET ||
+    crypto.createHash("sha256").update(process.env.GRADER_TOKEN || "dev-session-secret").digest("hex"),
+  cookieName: "sb_session",
+  pkceCookieName: "sb_pkce",
+  // Per-workspace outbound rate limit (requests per window)
+  rateLimitMax: Number(process.env.PIGEON_RATE_LIMIT_MAX || 8),
+  rateLimitWindowMs: Number(process.env.PIGEON_RATE_LIMIT_WINDOW_MS || 1000),
+};
+
+```
+
+#### `scaffold/server/src/db.ts`
+
+```ts
+import mongoose, { Schema, Document } from "mongoose";
+import { config } from "./config";
+
+export interface WorkspaceRole {
+  id: string;
+  role: "admin" | "agent";
+}
+
+export interface ConversationDoc extends Document {
+  workspaceId: string;
+  contact: string;
+  assignee: string | null;
+  status: "open" | "closed";
+  lastActivityAt: Date;
+}
+
+export interface InboundMessageDoc extends Document {
+  workspaceId: string;
+  contact: string;
+  messageId: string;
+  text: string;
+  receivedAt: Date;
+  sortOrder: number;
+}
+
+export interface OutboundMessageDoc extends Document {
+  workspaceId: string;
+  contact: string;
+  clientRef: string;
+  text: string;
+  status: "queued" | "sent" | "delivered" | "failed";
+  statusRank: number;
+  attempts: number;
+  nextAttemptAt: Date;
+  lockedBy: string | null;
+  lockExpiresAt: Date | null;
+  createdAt: Date;
+}
+
+export interface EventDoc extends Document {
+  workspaceId: string;
+  seq: number;
+  type: "message.inbound" | "message.status" | "conversation.assigned";
+  payload: Record<string, unknown>;
+  createdAt: Date;
+}
+
+const ConversationSchema = new Schema<ConversationDoc>(
+  {
+    workspaceId: { type: String, required: true, index: true },
+    contact: { type: String, required: true },
+    assignee: { type: String, default: null },
+    status: { type: String, enum: ["open", "closed"], default: "open" },
+    lastActivityAt: { type: Date, default: Date.now, index: true },
+  },
+  { timestamps: true }
+);
+ConversationSchema.index({ workspaceId: 1, contact: 1 }, { unique: true });
+
+const InboundMessageSchema = new Schema<InboundMessageDoc>(
+  {
+    workspaceId: { type: String, required: true, index: true },
+    contact: { type: String, required: true },
+    messageId: { type: String, required: true },
+    text: { type: String, default: "" },
+    receivedAt: { type: Date, default: Date.now },
+    sortOrder: { type: Number, required: true },
+  },
+  { timestamps: true }
+);
+InboundMessageSchema.index({ workspaceId: 1, messageId: 1 }, { unique: true });
+InboundMessageSchema.index({ workspaceId: 1, contact: 1, sortOrder: 1 });
+
+const OutboundMessageSchema = new Schema<OutboundMessageDoc>(
+  {
+    workspaceId: { type: String, required: true, index: true },
+    contact: { type: String, required: true },
+    clientRef: { type: String, required: true },
+    text: { type: String, required: true },
+    status: {
+      type: String,
+      enum: ["queued", "sent", "delivered", "failed"],
+      default: "queued",
+    },
+    statusRank: { type: Number, default: 1 }, // queued=1, sent=2, delivered=3, failed=0
+    attempts: { type: Number, default: 0 },
+    nextAttemptAt: { type: Date, default: Date.now, index: true },
+    lockedBy: { type: String, default: null },
+    lockExpiresAt: { type: Date, default: null, index: true },
+  },
+  { timestamps: true }
+);
+OutboundMessageSchema.index({ workspaceId: 1, clientRef: 1 }, { unique: true });
+OutboundMessageSchema.index({ status: 1, nextAttemptAt: 1, lockExpiresAt: 1 });
+
+const EventSchema = new Schema<EventDoc>(
+  {
+    workspaceId: { type: String, required: true, index: true },
+    seq: { type: Number, required: true },
+    type: {
+      type: String,
+      enum: ["message.inbound", "message.status", "conversation.assigned"],
+      required: true,
+    },
+    payload: { type: Schema.Types.Mixed, required: true },
+  },
+  { timestamps: true }
+);
+EventSchema.index({ workspaceId: 1, seq: 1 }, { unique: true });
+
+export const ConversationModel =
+  mongoose.models.Conversation || mongoose.model<ConversationDoc>("Conversation", ConversationSchema);
+export const InboundMessageModel =
+  mongoose.models.InboundMessage || mongoose.model<InboundMessageDoc>("InboundMessage", InboundMessageSchema);
+export const OutboundMessageModel =
+  mongoose.models.OutboundMessage || mongoose.model<OutboundMessageDoc>("OutboundMessage", OutboundMessageSchema);
+export const EventModel = mongoose.models.Event || mongoose.model<EventDoc>("Event", EventSchema);
+
+export async function connectMongo(): Promise<void> {
+  if (mongoose.connection.readyState === 1) return;
+  await mongoose.connect(config.mongoUrl);
+}
+
+```
+
+#### `scaffold/server/src/eventsAndQueue.ts`
+
+This handles:
+
+* Monotonic per-workspace `seq` generation via Redis `INCR` + Mongo persistence + Redis Pub/Sub fan-out across server replicas.
+* Catch-up replay (`?after=<seq>`) without losing/duplicating live events during initial subscription.
+* Distributed per-workspace rate limiting and durable lease-based outbound delivery that survives `kill -9` and multi-instance failover.
+
+```ts
+import crypto from "crypto";
+import Redis from "ioredis";
+import { WebSocket } from "ws";
+import { config } from "./config";
+import { ConversationModel, EventModel, OutboundMessageModel } from "./db";
+
+export const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
+export const redisSub = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
+
+const INSTANCE_ID = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+
+// Local WS clients keyed by workspaceId
+const localSubscribers = new Map<string, Set<WebSocket>>();
+const subscribedChannels = new Set<string>();
+
+function wsChannel(workspaceId: string): string {
+  return `switchboard:ws:${workspaceId}`;
+}
+
+redisSub.on("message", (channel, rawMessage) => {
+  const prefix = "switchboard:ws:";
+  if (!channel.startsWith(prefix)) return;
+  const workspaceId = channel.slice(prefix.length);
+  const sockets = localSubscribers.get(workspaceId);
+  if (!sockets || sockets.size === 0) return;
+
+  for (const ws of sockets) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(rawMessage);
+    }
+  }
+});
+
+export async function publishWorkspaceEvent(
+  workspaceId: string,
+  type: "message.inbound" | "message.status" | "conversation.assigned",
+  payload: Record<string, unknown>
+): Promise<{ seq: number; frame: Record<string, unknown> }> {
+  const seq = await redis.incr(`switchboard:seq:${workspaceId}`);
+  const frame = { seq, type, ...payload };
+
+  await EventModel.create({
+    workspaceId,
+    seq,
+    type,
+    payload,
+  });
+
+  await redis.publish(wsChannel(workspaceId), JSON.stringify(frame));
+  return { seq, frame };
+}
+
+export async function attachWebSocket(ws: WebSocket, workspaceId: string, afterSeq: number): Promise<void> {
+  const channel = wsChannel(workspaceId);
+  if (!subscribedChannels.has(channel)) {
+    subscribedChannels.add(channel);
+    await redisSub.subscribe(channel);
+  }
+
+  // Buffer live frames while we fetch historical catch-up events so nothing is missed
+  const buffer: string[] = [];
+  let flushing = true;
+
+  const bufferListener = (ch: string, msg: string) => {
+    if (ch !== channel) return;
+    if (flushing) {
+      buffer.push(msg);
+    } else if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  };
+
+  redisSub.on("message", bufferListener);
+
+  let set = localSubscribers.get(workspaceId);
+  if (!set) {
+    set = new Set();
+    localSubscribers.set(workspaceId, set);
+  }
+  set.add(ws);
+
+  const missed = await EventModel.find({ workspaceId, seq: { $gt: afterSeq } })
+    .sort({ seq: 1 })
+    .lean();
+
+  let lastSentSeq = afterSeq;
+  for (const ev of missed) {
+    if (ws.readyState !== WebSocket.OPEN) break;
+    lastSentSeq = Math.max(lastSentSeq, ev.seq);
+    ws.send(JSON.stringify({ seq: ev.seq, type: ev.type, ...(ev.payload || {}) }));
+  }
+
+  for (const raw of buffer) {
+    if (ws.readyState !== WebSocket.OPEN) break;
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed.seq === "number" && parsed.seq > lastSentSeq) {
+        lastSentSeq = parsed.seq;
+        ws.send(raw);
+      }
+    } catch {
+      ws.send(raw);
+    }
+  }
+  flushing = false;
+
+  ws.on("close", () => {
+    redisSub.off("message", bufferListener);
+    localSubscribers.get(workspaceId)?.delete(ws);
+  });
+}
+
+// Atomic per-workspace rate limiter shared across all server instances
+async function acquireWorkspaceRateSlot(workspaceId: string): Promise<boolean> {
+  const bucket = Math.floor(Date.now() / config.rateLimitWindowMs);
+  const key = `switchboard:rl:${workspaceId}:${bucket}`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.pexpire(key, config.rateLimitWindowMs * 2);
+  }
+  return count <= config.rateLimitMax;
+}
+
+const STATUS_RANK: Record<string, number> = {
+  failed: 0,
+  queued: 1,
+  sent: 2,
+  delivered: 3,
+};
+
+export async function enqueueReply(params: {
+  workspaceId: string;
+  contact: string;
+  text: string;
+  clientRef: string;
+}): Promise<{ accepted: true }> {
+  const { workspaceId, contact, text, clientRef } = params;
+
+  await ConversationModel.findOneAndUpdate(
+    { workspaceId, contact },
+    {
+      $setOnInsert: { workspaceId, contact, assignee: null, status: "open" },
+      $set: { lastActivityAt: new Date() },
+    },
+    { upsert: true, new: true }
+  );
+
+  // Idempotent on (workspaceId, clientRef): concurrent or repeated calls never duplicate
+  await OutboundMessageModel.updateOne(
+    { workspaceId, clientRef },
+    {
+      $setOnInsert: {
+        workspaceId,
+        contact,
+        clientRef,
+        text,
+        status: "queued",
+        statusRank: STATUS_RANK.queued,
+        attempts: 0,
+        nextAttemptAt: new Date(),
+        lockedBy: null,
+        lockExpiresAt: null,
+      },
+    },
+    { upsert: true }
+  );
+
+  return { accepted: true };
+}
+
+export async function updateOutboundStatus(
+  workspaceId: string,
+  clientRef: string,
+  nextStatus: "queued" | "sent" | "delivered" | "failed",
+  contactHint?: string
+): Promise<void> {
+  const doc = await OutboundMessageModel.findOne({ workspaceId, clientRef });
+  if (!doc) return;
+
+  const incomingRank = STATUS_RANK[nextStatus] ?? 0;
+  // Ignore stale/out-of-order lower status transitions except terminal failure if still queued
+  if (incomingRank < doc.statusRank && !(nextStatus === "failed" && doc.status === "queued")) {
+    return;
+  }
+  if (doc.status === nextStatus) return;
+
+  doc.status = nextStatus;
+  doc.statusRank = incomingRank;
+  doc.lockedBy = null;
+  doc.lockExpiresAt = null;
+  await doc.save();
+
+  await publishWorkspaceEvent(workspaceId, "message.status", {
+    contact: contactHint || doc.contact,
+    client_ref: clientRef,
+    status: nextStatus,
+  });
+}
+
+async function processOneOutboundJob(): Promise<boolean> {
+  const now = new Date();
+  const leaseUntil = new Date(now.getTime() + 20_000);
+
+  // Claim a queued message whose lease is either null or expired (e.g., after kill -9)
+  const job = await OutboundMessageModel.findOneAndUpdate(
+    {
+      status: "queued",
+      nextAttemptAt: { $lte: now },
+      $or: [{ lockExpiresAt: null }, { lockExpiresAt: { $lte: now } }],
+    },
+    {
+      $set: { lockedBy: INSTANCE_ID, lockExpiresAt: leaseUntil },
+      $inc: { attempts: 1 },
+    },
+    { sort: { createdAt: 1 }, new: true }
+  );
+
+  if (!job) return false;
+
+  const allowed = await acquireWorkspaceRateSlot(job.workspaceId);
+  if (!allowed) {
+    // Release lock and push out slightly rather than burning attempts on self-throttling
+    await OutboundMessageModel.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          lockedBy: null,
+          lockExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + 250 + Math.random() * 250),
+        },
+        $inc: { attempts: -1 },
+      }
+    );
+    return false;
+  }
+
+  try {
+    // Adjust path/body keys to match PIGEON.md if Pigeon expects different field names
+    const res = await fetch(`${config.pigeonUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": job.clientRef,
+      },
+      body: JSON.stringify({
+        workspace: job.workspaceId,
+        workspace_id: job.workspaceId,
+        to: job.contact,
+        contact: job.contact,
+        text: job.text,
+        client_ref: job.clientRef,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (res.ok) {
+      await updateOutboundStatus(job.workspaceId, job.clientRef, "sent", job.contact);
+      return true;
+    }
+
+    if (res.status === 429) {
+      const retryAfterSec = Number(res.headers.get("retry-after") || "1");
+      const delayMs = Math.max(200, retryAfterSec * 1000) + Math.floor(Math.random() * 200);
+      await OutboundMessageModel.updateOne(
+        { _id: job._id },
+        { $set: { lockedBy: null, lockExpiresAt: null, nextAttemptAt: new Date(Date.now() + delayMs) } }
+      );
+      return true;
+    }
+
+    if (res.status >= 400 && res.status < 500) {
+      await updateOutboundStatus(job.workspaceId, job.clientRef, "failed", job.contact);
+      return true;
+    }
+
+    // 5xx or transient failure: backoff and retry
+    const backoffMs = Math.min(10_000, 300 * Math.pow(1.6, Math.min(job.attempts, 8)));
+    await OutboundMessageModel.updateOne(
+      { _id: job._id },
+      { $set: { lockedBy: null, lockExpiresAt: null, nextAttemptAt: new Date(Date.now() + backoffMs) } }
+    );
+    return true;
+  } catch {
+    const backoffMs = Math.min(10_000, 300 * Math.pow(1.6, Math.min(job.attempts, 8)));
+    await OutboundMessageModel.updateOne(
+      { _id: job._id },
+      { $set: { lockedBy: null, lockExpiresAt: null, nextAttemptAt: new Date(Date.now() + backoffMs) } }
+    );
+    return true;
+  }
+}
+
+let workerTimer: NodeJS.Timeout | null = null;
+let workerRunning = false;
+
+export function startOutboundWorker(): void {
+  if (workerTimer) return;
+  const tick = async () => {
+    if (workerRunning) return;
+    workerRunning = true;
+    try {
+      // Drain up to 10 ready jobs per tick
+      for (let i = 0; i < 10; i++) {
+        const processed = await processOneOutboundJob();
+        if (!processed) break;
+      }
+    } finally {
+      workerRunning = false;
+    }
+  };
+  workerTimer = setInterval(tick, 120);
+  tick().catch(() => {});
+}
+
+```
+
+#### `scaffold/server/src/index.ts`
+
+```ts
+import crypto from "crypto";
+import http from "http";
+import express, { Request, Response, NextFunction } from "express";
+import cookieParser from "cookie-parser";
+import { WebSocketServer } from "ws";
+import { config } from "./config";
+import {
+  connectMongo,
+  ConversationModel,
+  EventModel,
+  InboundMessageModel,
+  OutboundMessageModel,
+  WorkspaceRole,
+} from "./db";
+import {
+  attachWebSocket,
+  enqueueReply,
+  publishWorkspaceEvent,
+  redis,
+  startOutboundWorker,
+  updateOutboundStatus,
+} from "./eventsAndQueue";
+
+const app = express();
+
+// Capture raw body so webhook signature verification can hash exact bytes
+app.use(
+  express.json({
+    verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+app.use(cookieParser());
+
+function signSession(payload: { sub: string; workspaces: WorkspaceRole[] }): string {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = crypto.createHmac("sha256", config.sessionSecret).update(encoded).digest("base64url");
+  return `${encoded}.${sig}`;
+}
+
+function readSession(req: Request): { sub: string; workspaces: WorkspaceRole[] } | null {
+  const raw = req.cookies?.[config.cookieName];
+  if (!raw || typeof raw !== "string") return null;
+  const parts = raw.split(".");
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  const expected = crypto.createHmac("sha256", config.sessionSecret).update(encoded).digest("base64url");
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const session = readSession(req);
+  if (!session) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  (req as Request & { session?: { sub: string; workspaces: WorkspaceRole[] } }).session = session;
+  next();
+}
+
+function requireWorkspaceMember(req: Request, res: Response, workspaceId: string): boolean {
+  const session = (req as Request & { session?: { sub: string; workspaces: WorkspaceRole[] } }).session;
+  if (!session) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  const hasAccess = session.workspaces.some((w) => w.id === workspaceId);
+  if (!hasAccess) {
+    res.status(403).json({ error: "forbidden" });
+    return false;
+  }
+  return true;
+}
+
+// Health check
+app.get("/healthz", async (_req, res) => {
+  try {
+    await redis.ping();
+    res.status(200).json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+
+// OIDC Authorization Code + PKCE against Mock IdP (:4020)
+app.get("/auth/login", async (_req, res) => {
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  const state = crypto.randomBytes(16).toString("hex");
+
+  await redis.set(`switchboard:pkce:${state}`, verifier, "EX", 600);
+
+  const authUrl = new URL(`${config.idpUrl}/authorize`);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("client_id", config.idpClientId);
+  authUrl.searchParams.set("redirect_uri", `${config.publicUrl}/auth/callback`);
+  authUrl.searchParams.set("scope", "openid profile email");
+  authUrl.searchParams.set("state", state);
+  authUrl.searchParams.set("code_challenge", challenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
+
+  res.redirect(authUrl.toString());
+});
+
+app.get("/auth/callback", async (req, res) => {
+  const code = String(req.query.code || "");
+  const state = String(req.query.state || "");
+  if (!code || !state) {
+    res.status(400).send("Missing code or state");
+    return;
+  }
+
+  const verifier = await redis.get(`switchboard:pkce:${state}`);
+  if (!verifier) {
+    res.status(400).send("Invalid or expired PKCE state");
+    return;
+  }
+  await redis.del(`switchboard:pkce:${state}`);
+
+  const tokenRes = await fetch(`${config.idpUrl}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: config.idpClientId,
+      redirect_uri: `${config.publicUrl}/auth/callback`,
+      code_verifier: verifier,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    res.status(502).send("Token exchange failed");
+    return;
+  }
+
+  const tokenData = (await tokenRes.json()) as { id_token?: string; access_token?: string };
+  const rawJwt = tokenData.id_token || tokenData.access_token || "";
+  const parts = rawJwt.split(".");
+  if (parts.length < 2) {
+    res.status(502).send("Malformed token from IdP");
+    return;
+  }
+
+  const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
+    sub?: string;
+    workspaces?: WorkspaceRole[];
+  };
+
+  if (!claims.sub) {
+    res.status(502).send("Missing sub in token");
+    return;
+  }
+
+  const sessionPayload = {
+    sub: claims.sub,
+    workspaces: Array.isArray(claims.workspaces) ? claims.workspaces : [],
+  };
+
+  res.cookie(config.cookieName, signSession(sessionPayload), {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+  });
+
+  res.redirect(`${config.frontendUrl}/`);
+});
+
+app.get("/api/me", requireAuth, (req, res) => {
+  const session = (req as Request & { session: { sub: string; workspaces: WorkspaceRole[] } }).session;
+  res.status(200).json(session);
+});
+
+app.get("/api/conversations", requireAuth, async (req, res) => {
+  const workspaceId = String(req.query.workspace || "");
+  if (!workspaceId) {
+    res.status(400).json({ error: "workspace is required" });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  const conversations = await ConversationModel.find({ workspaceId })
+    .sort({ lastActivityAt: -1 })
+    .skip(offset)
+    .limit(limit)
+    .lean();
+
+  res.status(200).json({ conversations });
+});
+
+app.get("/api/conversations/:contact/messages", requireAuth, async (req, res) => {
+  const workspaceId = String(req.query.workspace || "");
+  const contact = decodeURIComponent(String(req.params.contact || ""));
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: "workspace and contact are required" });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  const inbound = await InboundMessageModel.find({ workspaceId, contact }).sort({ sortOrder: 1 }).lean();
+  const outbound = await OutboundMessageModel.find({ workspaceId, contact }).sort({ createdAt: 1 }).lean();
+  res.status(200).json({ inbound, outbound });
+});
+
+app.post("/api/conversations/:contact/claim", requireAuth, async (req, res) => {
+  const session = (req as Request & { session: { sub: string; workspaces: WorkspaceRole[] } }).session;
+  const workspaceId = String(req.body?.workspace || req.query.workspace || "");
+  const contact = decodeURIComponent(String(req.params.contact || ""));
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: "workspace and contact are required" });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  const result = await claimConversation(workspaceId, contact, session.sub);
+  res.status(result.status).json(result.body);
+});
+
+app.post("/api/conversations/:contact/status", requireAuth, async (req, res) => {
+  const workspaceId = String(req.body?.workspace || "");
+  const contact = decodeURIComponent(String(req.params.contact || ""));
+  const status = req.body?.status === "closed" ? "closed" : "open";
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: "workspace and contact are required" });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  const conv = await ConversationModel.findOneAndUpdate(
+    { workspaceId, contact },
+    { $set: { status, lastActivityAt: new Date() } },
+    { upsert: true, new: true }
+  );
+  res.status(200).json({ conversation: conv });
+});
+
+app.post("/api/replies", requireAuth, async (req, res) => {
+  const workspaceId = String(req.body?.workspace || "");
+  const contact = String(req.body?.contact || "");
+  const text = String(req.body?.text || "");
+  const clientRef = String(req.body?.client_ref || crypto.randomUUID());
+
+  if (!workspaceId || !contact || !text) {
+    res.status(400).json({ error: "workspace, contact, and text are required" });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  await enqueueReply({ workspaceId, contact, text, clientRef });
+  res.status(202).json({ accepted: true, client_ref: clientRef });
+});
+
+// Shared business logic for claiming (used by UI route and grader)
+async function claimConversation(
+  workspaceId: string,
+  contact: string,
+  agent: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  await ConversationModel.updateOne(
+    { workspaceId, contact },
+    {
+      $setOnInsert: { workspaceId, contact, assignee: null, status: "open", lastActivityAt: new Date() },
+    },
+    { upsert: true }
+  );
+
+  const claimed = await ConversationModel.findOneAndUpdate(
+    {
+      workspaceId,
+      contact,
+      assignee: { $in: [null, agent] },
+    },
+    {
+      $set: { assignee: agent, status: "open", lastActivityAt: new Date() },
+    },
+    { new: true }
+  );
+
+  if (!claimed) {
+    const current = await ConversationModel.findOne({ workspaceId, contact }).lean();
+    return {
+      status: 409,
+      body: { error: "already_claimed", assignee: current?.assignee ?? null },
+    };
+  }
+
+  await publishWorkspaceEvent(workspaceId, "conversation.assigned", {
+    contact,
+    assignee: agent,
+  });
+
+  return {
+    status: 200,
+    body: { contact, assignee: claimed.assignee, status: claimed.status },
+  };
+}
+
+// Pigeon webhook receiver: verify signature per PIGEON.md, deduplicate, order, and broadcast
+function verifyPigeonSignature(req: Request & { rawBody?: Buffer }): boolean {
+  if (!config.pigeonWebhookSecret) return true;
+  const sigHeader = String(
+    req.headers["x-pigeon-signature"] || req.headers["x-signature-256"] || req.headers["x-signature"] || ""
+  );
+  if (!sigHeader || !req.rawBody) return false;
+  const cleaned = sigHeader.replace(/^sha256=/, "");
+  const expected = crypto.createHmac("sha256", config.pigeonWebhookSecret).update(req.rawBody).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(cleaned), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+app.post("/webhooks/pigeon", async (req: Request & { rawBody?: Buffer }, res) => {
+  if (!verifyPigeonSignature(req)) {
+    res.status(401).json({ error: "invalid_signature" });
+    return;
+  }
+
+  const body = req.body || {};
+  const workspaceId = String(body.workspace || body.workspace_id || "");
+  const type = String(body.type || body.event || "");
+
+  if (!workspaceId) {
+    res.status(400).json({ error: "missing_workspace" });
+    return;
+  }
+
+  // Inbound customer message
+  if (type === "message.inbound" || body.message_id || body.messageId) {
+    const contact = String(body.contact || body.from || "");
+    const messageId = String(body.message_id || body.messageId || "");
+    const text = String(body.text || body.body || "");
+    if (!contact || !messageId) {
+      res.status(400).json({ error: "invalid_inbound_payload" });
+      return;
+    }
+
+    const sortOrder = body.timestamp ? Number(new Date(body.timestamp).getTime()) || Date.now() : Date.now();
+
+    const inserted = await InboundMessageModel.findOneAndUpdate(
+      { workspaceId, messageId },
+      {
+        $setOnInsert: {
+          workspaceId,
+          contact,
+          messageId,
+          text,
+          receivedAt: new Date(sortOrder),
+          sortOrder,
+        },
+      },
+      { upsert: true, rawResult: true }
+    );
+
+    const isNew = !inserted.lastErrorObject?.updatedExisting;
+
+    await ConversationModel.findOneAndUpdate(
+      { workspaceId, contact },
+      {
+        $setOnInsert: { workspaceId, contact, assignee: null, status: "open" },
+        $set: { lastActivityAt: new Date(sortOrder) },
+      },
+      { upsert: true }
+    );
+
+    if (isNew) {
+      await publishWorkspaceEvent(workspaceId, "message.inbound", {
+        contact,
+        message_id: messageId,
+        text,
+      });
+    }
+
+    res.status(200).json({ ok: true, duplicate: !isNew });
+    return;
+  }
+
+  // Outbound delivery status webhook from Pigeon
+  if (type === "message.status" || body.client_ref || body.clientRef) {
+    const clientRef = String(body.client_ref || body.clientRef || "");
+    const rawStatus = String(body.status || "").toLowerCase();
+    const contact = String(body.contact || body.to || "");
+    const mappedStatus: "queued" | "sent" | "delivered" | "failed" | null =
+      rawStatus === "delivered" || rawStatus === "sent" || rawStatus === "failed" || rawStatus === "queued"
+        ? rawStatus
+        : null;
+
+    if (!clientRef || !mappedStatus) {
+      res.status(400).json({ error: "invalid_status_payload" });
+      return;
+    }
+
+    await updateOutboundStatus(workspaceId, clientRef, mappedStatus, contact || undefined);
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  res.status(200).json({ ok: true });
+});
+
+// Grader endpoints protected by x-grader-token
+function requireGrader(req: Request, res: Response, next: NextFunction): void {
+  const token = String(req.headers["x-grader-token"] || "");
+  if (!config.graderToken || token !== config.graderToken) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  next();
+}
+
+app.post("/__grader/reset", requireGrader, async (_req, res) => {
+  await Promise.all([
+    ConversationModel.deleteMany({}),
+    InboundMessageModel.deleteMany({}),
+    OutboundMessageModel.deleteMany({}),
+    EventModel.deleteMany({}),
+  ]);
+
+  const keys = await redis.keys("switchboard:*");
+  const appKeys = keys.filter((k) => !k.startsWith("switchboard:pkce:"));
+  if (appKeys.length > 0) {
+    await redis.del(appKeys);
+  }
+
+  res.status(200).json({ ok: true });
+});
+
+app.get("/__grader/snapshot", requireGrader, async (_req, res) => {
+  const [conversations, inboundMessages, outboundMessages] = await Promise.all([
+    ConversationModel.find({}).lean(),
+    InboundMessageModel.find({}).sort({ sortOrder: 1, _id: 1 }).lean(),
+    OutboundMessageModel.find({}).lean(),
+  ]);
+
+  const workspaces: Record<
+    string,
+    {
+      contacts: Record<string, { inbound: string[]; assignee: string | null }>;
+      outbound: Record<string, string>;
+    }
+  > = {};
+
+  const ensureWs = (wsId: string) => {
+    if (!workspaces[wsId]) {
+      workspaces[wsId] = { contacts: {}, outbound: {} };
+    }
+    return workspaces[wsId];
+  };
+
+  for (const conv of conversations) {
+    const ws = ensureWs(conv.workspaceId);
+    if (!ws.contacts[conv.contact]) {
+      ws.contacts[conv.contact] = { inbound: [], assignee: conv.assignee ?? null };
+    } else {
+      ws.contacts[conv.contact].assignee = conv.assignee ?? null;
+    }
+  }
+
+  for (const msg of inboundMessages) {
+    const ws = ensureWs(msg.workspaceId);
+    if (!ws.contacts[msg.contact]) {
+      ws.contacts[msg.contact] = { inbound: [], assignee: null };
+    }
+    ws.contacts[msg.contact].inbound.push(msg.messageId);
+  }
+
+  for (const out of outboundMessages) {
+    const ws = ensureWs(out.workspaceId);
+    ws.outbound[out.clientRef] = out.status;
+  }
+
+  res.status(200).json({ workspaces });
+});
+
+app.post("/__grader/reply", requireGrader, async (req, res) => {
+  const workspace = String(req.body?.workspace || "");
+  const contact = String(req.body?.contact || "");
+  const text = String(req.body?.text || "");
+  const clientRef = String(req.body?.client_ref || "");
+
+  if (!workspace || !contact || !text || !clientRef) {
+    res.status(400).json({ error: "missing_fields" });
+    return;
+  }
+
+  // Reject unknown workspaces with 4xx when workspace validation is configured
+  const knownWorkspaces = process.env.KNOWN_WORKSPACES
+    ? process.env.KNOWN_WORKSPACES.split(",").map((s) => s.trim())
+    : ["ws_acme", "ws_globex"];
+  if (!knownWorkspaces.includes(workspace)) {
+    res.status(404).json({ error: "unknown_workspace" });
+    return;
+  }
+
+  await enqueueReply({ workspaceId: workspace, contact, text, clientRef });
+  res.status(202).json({ accepted: true, client_ref: clientRef });
+});
+
+app.post("/__grader/claim", requireGrader, async (req, res) => {
+  const workspace = String(req.body?.workspace || "");
+  const contact = String(req.body?.contact || "");
+  const agent = String(req.body?.agent || "");
+
+  if (!workspace || !contact || !agent) {
+    res.status(400).json({ error: "missing_fields" });
+    return;
+  }
+
+  const result = await claimConversation(workspace, contact, agent);
+  res.status(result.status).json(result.body);
+});
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  if (url.pathname !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  // Parse cookie from upgrade request
+  const cookieHeader = req.headers.cookie || "";
+  const parsedCookies: Record<string, string> = {};
+  for (const part of cookieHeader.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx > 0) {
+      parsedCookies[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    }
+  }
+
+  const fakeReq = { cookies: parsedCookies } as Request;
+  const session = readSession(fakeReq);
+  const workspaceId = url.searchParams.get("workspace") || "";
+  const afterSeq = Math.max(0, Number(url.searchParams.get("after") || "0") || 0);
+
+  if (!session) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  if (!workspaceId || !session.workspaces.some((w) => w.id === workspaceId)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    attachWebSocket(ws, workspaceId, afterSeq).catch(() => ws.close());
+  });
+});
+
+async function main(): Promise<void> {
+  await connectMongo();
+  startOutboundWorker();
+  server.listen(config.port, () => {
+    console.log(`Switchboard server listening on :${config.port}`);
+  });
+}
+
+main().catch((err) => {
+  console.error("Failed to start Switchboard server:", err);
+  process.exit(1);
+});
+
+```
+
+---
+
+### 3. React Inbox Frontend (`scaffold/web/src/App.tsx`)
+
+Make sure Vite proxies `/api`, `/auth`, and `/ws` (or set `VITE_API_URL` to your server origin) with `credentials: "include"` so the session cookie flows cleanly.
+
+```tsx
+import React, { useEffect, useRef, useState } from "react";
+
+interface WorkspaceRole {
+  id: string;
+  role: "admin" | "agent";
+}
+
+interface MeResponse {
+  sub: string;
+  workspaces: WorkspaceRole[];
+}
+
+interface Conversation {
+  _id: string;
+  workspaceId: string;
+  contact: string;
+  assignee: string | null;
+  status: "open" | "closed";
+  lastActivityAt: string;
+}
+
+interface InboundMsg {
+  _id: string;
+  messageId: string;
+  text: string;
+  sortOrder: number;
+}
+
+interface OutboundMsg {
+  _id: string;
+  clientRef: string;
+  text: string;
+  status: "queued" | "sent" | "delivered" | "failed";
+}
+
+export function App() {
+  const [me, setMe] = useState<MeResponse | null>(null);
+  const [loadingMe, setLoadingMe] = useState(true);
+  const [workspaceId, setWorkspaceId] = useState<string>("");
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [selectedContact, setSelectedContact] = useState<string>("");
+  const [inbound, setInbound] = useState<InboundMsg[]>([]);
+  const [outbound, setOutbound] = useState<OutboundMsg[]>([]);
+  const [replyText, setReplyText] = useState("");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const lastSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    fetch("/api/me", { credentials: "include" })
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return (await res.json()) as MeResponse;
+      })
+      .then((data) => {
+        setMe(data);
+        if (data?.workspaces?.length) {
+          setWorkspaceId(data.workspaces[0].id);
+        }
+      })
+      .finally(() => setLoadingMe(false));
+  }, []);
+
+  async function loadConversations(ws: string) {
+    const res = await fetch(`/api/conversations?workspace=${encodeURIComponent(ws)}`, {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      setErrorMsg(`Failed to load inbox (${res.status})`);
+      return;
+    }
+    const data = (await res.json()) as { conversations: Conversation[] };
+    setConversations(data.conversations || []);
+  }
+
+  async function loadMessages(ws: string, contact: string) {
+    const res = await fetch(
+      `/api/conversations/${encodeURIComponent(contact)}/messages?workspace=${encodeURIComponent(ws)}`,
+      { credentials: "include" }
+    );
+    if (!res.ok) return;
+    const data = (await res.json()) as { inbound: InboundMsg[]; outbound: OutboundMsg[] };
+    setInbound(data.inbound || []);
+    setOutbound(data.outbound || []);
+  }
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    lastSeqRef.current = 0;
+    setErrorMsg(null);
+    loadConversations(workspaceId);
+    if (selectedContact) {
+      loadMessages(workspaceId, selectedContact);
+    }
+
+    let closedIntentionally = false;
+    let reconnectTimer: number | null = null;
+    let socket: WebSocket | null = null;
+
+    const connectWs = () => {
+      if (closedIntentionally) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/ws?workspace=${encodeURIComponent(
+        workspaceId
+      )}&after=${lastSeqRef.current}`;
+
+      socket = new WebSocket(wsUrl);
+      socket.onmessage = (evt) => {
+        try {
+          const frame = JSON.parse(evt.data);
+          if (typeof frame.seq === "number" && frame.seq > lastSeqRef.current) {
+            lastSeqRef.current = frame.seq;
+          }
+          if (frame.type === "message.inbound") {
+            loadConversations(workspaceId);
+            if (frame.contact === selectedContact) {
+              loadMessages(workspaceId, selectedContact);
+            }
+          } else if (frame.type === "message.status") {
+            setOutbound((prev) =>
+              prev.map((m) => (m.clientRef === frame.client_ref ? { ...m, status: frame.status } : m))
+            );
+          } else if (frame.type === "conversation.assigned") {
+            setConversations((prev) =>
+              prev.map((c) => (c.contact === frame.contact ? { ...c, assignee: frame.assignee } : c))
+            );
+          }
+        } catch {
+          // ignore malformed frame
+        }
+      };
+
+      socket.onclose = () => {
+        if (!closedIntentionally) {
+          reconnectTimer = window.setTimeout(connectWs, 1000);
+        }
+      };
+    };
+
+    connectWs();
+
+    return () => {
+      closedIntentionally = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [workspaceId, selectedContact]);
+
+  async function handleClaim(contact: string) {
+    setErrorMsg(null);
+    const res = await fetch(`/api/conversations/${encodeURIComponent(contact)}/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ workspace: workspaceId }),
+    });
+    if (res.status === 409) {
+      const data = await res.json().catch(() => ({}));
+      setErrorMsg(`Already claimed by ${data.assignee || "another agent"}`);
+    }
+    await loadConversations(workspaceId);
+  }
+
+  async function handleSendReply(e: React.FormEvent) {
+    e.preventDefault();
+    if (!selectedContact || !replyText.trim()) return;
+    const text = replyText.trim();
+    const clientRef = `ref_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    setReplyText("");
+
+    setOutbound((prev) => [...prev, { _id: clientRef, clientRef, text, status: "queued" }]);
+
+    await fetch("/api/replies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({
+        workspace: workspaceId,
+        contact: selectedContact,
+        text,
+        client_ref: clientRef,
+      }),
+    });
+  }
+
+  if (loadingMe) return <div style={{ padding: 24 }}>Loading session...</div>;
+
+  if (!me) {
+    return (
+      <div style={{ padding: 32, fontFamily: "sans-serif" }}>
+        <h1>Switchboard Inbox</h1>
+        <p>Sign in with the Mock IdP to access your workspace inbox.</p>
+        <a href="/auth/login">Sign in with IdP</a>
+      </div>
+    );
+  }
+
+  const activeConv = conversations.find((c) => c.contact === selectedContact) || null;
+
+  return (
+    <div style={{ display: "flex", height: "100vh", fontFamily: "sans-serif" }}>
+      <aside style={{ width: 320, borderRight: "1px solid #ddd", padding: 16, overflowY: "auto" }}>
+        <div style={{ marginBottom: 12 }}>
+          <strong>{me.sub}</strong>
+          <div style={{ marginTop: 8 }}>
+            <select
+              value={workspaceId}
+              onChange={(e) => {
+                setSelectedContact("");
+                setWorkspaceId(e.target.value);
+              }}
+            >
+              {me.workspaces.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.id} ({w.role})
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {errorMsg && <div style={{ color: "#b91c1c", marginBottom: 10, fontSize: 13 }}>{errorMsg}</div>}
+
+        {conversations.map((c) => (
+          <div
+            key={c.contact}
+            onClick={() => setSelectedContact(c.contact)}
+            style={{
+              padding: 10,
+              borderRadius: 6,
+              cursor: "pointer",
+              marginBottom: 6,
+              background: c.contact === selectedContact ? "#eef2ff" : "#f9fafb",
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>{c.contact}</div>
+            <div style={{ fontSize: 12, color: "#555" }}>
+              Assignee: {c.assignee || "Unassigned"} · {c.status}
+            </div>
+          </div>
+        ))}
+      </aside>
+
+      <main style={{ flex: 1, display: "flex", flexDirection: "column", padding: 16 }}>
+        {!selectedContact ? (
+          <div>Select a conversation from the inbox.</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #ddd", paddingBottom: 10 }}>
+              <div>
+                <h2 style={{ margin: 0 }}>{selectedContact}</h2>
+                <small>
+                  Assignee: {activeConv?.assignee || "Unassigned"} | Status: {activeConv?.status || "open"}
+                </small>
+              </div>
+              <button onClick={() => handleClaim(selectedContact)}>Claim</button>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", padding: "12px 0", display: "flex", flexDirection: "column", gap: 8 }}>
+              {inbound.map((m) => (
+                <div key={m.messageId} style={{ alignSelf: "flex-start", background: "#f3f4f6", padding: "8px 12px", borderRadius: 8 }}>
+                  <div>{m.text}</div>
+                  <small style={{ color: "#666" }}>Customer · {m.messageId}</small>
+                </div>
+              ))}
+              {outbound.map((m) => (
+                <div key={m.clientRef} style={{ alignSelf: "flex-end", background: "#dbeafe", padding: "8px 12px", borderRadius: 8 }}>
+                  <div>{m.text}</div>
+                  <small style={{ color: "#1e40af" }}>Agent · {m.status}</small>
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={handleSendReply} style={{ display: "flex", gap: 8 }}>
+              <input
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                placeholder="Type a reply..."
+                style={{ flex: 1, padding: 8 }}
+              />
+              <button type="submit">Send</button>
+            </form>
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default App;
+
+```
+
+---
+
+### 4. Quick Checklist Before Submitting
+
+1. **Verify `PIGEON.md` details:** Check Pigeon's exact webhook header/HMAC format and `/v1/messages` field names, and update `verifyPigeonSignature` and `processOneOutboundJob` if needed.
+2. **Test incrementally:** Stop your manual dev server before running `npm run check`, `npm run check -- --levels 5`, and `npm run check:full` so `CHECK_REPORT.json` is written cleanly.
+3. **Required repo artifacts:** Ensure `README.md`, `switchboard.json`, `DECISIONS.md` (with known gaps/assumptions), `CHECK_REPORT.json`, and `ai-logs/` are committed before making the repo public and submitting the commit hash.
+
+Which part do you want to tackle first—adapting the Pigeon signature/payload rules from `PIGEON.md`, or wiring up `switchboard.json` and running `npm run check`?
+
+here is the pigeon file, take this into account and then give me the full and final codebase
+
+That matches your starter files closely. Here are a few important details from your provided files that we should line up directly with the code:
+
+* **ESM imports:** Your server uses `"type": "module"`, so local imports should keep `.js` extensions (`./config.js`, `./db.js`, `./redis.js`), and `tsx src/index.ts` runs directly (and `npm run typecheck` checks types).
+* **Existing helpers:** `config.ts` already maps `config.pigeon.url`, `config.pigeon.webhookSecret`, `config.pigeon.apiKeys`, `config.oidc.*`, `config.graderToken`, and `config.webOrigin`. `db.ts` provides `getDb()` using the native `mongodb` driver, and `redis.ts` provides `getRedis()` using `ioredis`.
+
+
+* **Packages installed:** Notice `cookie-parser` is in `server/package.json`, while `@types/cookie-parser` and `@types/ws` aren't listed yet—so we can parse cookies/upgrade headers cleanly in Node/Express without relying on missing `@types/*` packages, or install them if needed.
+
+Here is the clean, drop-in server and frontend code aligned with your starter files and `PIGEON.md`.
+
+---
+
+### 1. Server Files (`scaffold/server/src`)
+
+#### `scaffold/server/src/types.ts`
+
+```ts
+export interface WorkspaceRole {
+  id: string;
+  role: 'admin' | 'agent';
+}
+
+export interface SessionPayload {
+  sub: string;
+  workspaces: WorkspaceRole[];
+}
+
+export interface ConversationDoc {
+  workspaceId: string;
+  contact: string;
+  assignee: string | null;
+  status: 'open' | 'closed';
+  lastActivityAt: Date;
+}
+
+export interface InboundMessageDoc {
+  workspaceId: string;
+  contact: string;
+  messageId: string;
+  text: string;
+  occurredAt: Date;
+  sortOrder: number;
+}
+
+export interface OutboundMessageDoc {
+  workspaceId: string;
+  contact: string;
+  clientRef: string;
+  pigeonMessageId: string | null;
+  text: string;
+  status: 'queued' | 'sent' | 'delivered' | 'failed';
+  statusRank: number;
+  attempts: number;
+  nextAttemptAt: Date;
+  lockedBy: string | null;
+  lockExpiresAt: Date | null;
+  createdAt: Date;
+}
+
+export interface EventDoc {
+  workspaceId: string;
+  seq: number;
+  type: 'message.inbound' | 'message.status' | 'conversation.assigned';
+  payload: Record<string, unknown>;
+}
+
+```
+
+#### `scaffold/server/src/store.ts`
+
+```ts
+import crypto from 'node:crypto';
+import { WebSocket } from 'ws';
+import { config } from './config.js';
+import { getDb } from './db.js';
+import { getRedis } from './redis.js';
+import type {
+  ConversationDoc,
+  EventDoc,
+  InboundMessageDoc,
+  OutboundMessageDoc,
+} from './types.js';
+
+const INSTANCE_ID = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+const RATE_LIMIT_MAX = Number(process.env.PIGEON_RATE_LIMIT_MAX || '4');
+const RATE_LIMIT_WINDOW_MS = Number(process.env.PIGEON_RATE_LIMIT_WINDOW_MS || '1000');
+
+const STATUS_RANK: Record<OutboundMessageDoc['status'], number> = {
+  failed: 0,
+  queued: 1,
+  sent: 2,
+  delivered: 3,
+};
+
+let indexesEnsured = false;
+let redisSubClient: ReturnType<typeof getRedis> | null = null;
+const localSubscribers = new Map<string, Set<WebSocket>>();
+const subscribedChannels = new Set<string>();
+
+function wsChannel(workspaceId: string): string {
+  return `switchboard:ws:${workspaceId}`;
+}
+
+function getSubscriber() {
+  if (!redisSubClient) {
+    redisSubClient = getRedis().duplicate();
+    redisSubClient.on('message', (channel: string, rawMessage: string) => {
+      const prefix = 'switchboard:ws:';
+      if (!channel.startsWith(prefix)) return;
+      const workspaceId = channel.slice(prefix.length);
+      const sockets = localSubscribers.get(workspaceId);
+      if (!sockets || sockets.size === 0) return;
+
+      for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(rawMessage);
+        }
+      }
+    });
+  }
+  return redisSubClient;
+}
+
+export async function ensureIndexes(): Promise<void> {
+  if (indexesEnsured) return;
+  const db = await getDb();
+
+  await Promise.all([
+    db.collection<ConversationDoc>('conversations').createIndex(
+      { workspaceId: 1, contact: 1 },
+      { unique: true }
+    ),
+    db.collection<ConversationDoc>('conversations').createIndex({
+      workspaceId: 1,
+      lastActivityAt: -1,
+    }),
+    db.collection<InboundMessageDoc>('inbound_messages').createIndex(
+      { workspaceId: 1, messageId: 1 },
+      { unique: true }
+    ),
+    db.collection<InboundMessageDoc>('inbound_messages').createIndex({
+      workspaceId: 1,
+      contact: 1,
+      sortOrder: 1,
+    }),
+    db.collection<OutboundMessageDoc>('outbound_messages').createIndex(
+      { workspaceId: 1, clientRef: 1 },
+      { unique: true }
+    ),
+    db.collection<OutboundMessageDoc>('outbound_messages').createIndex({
+      status: 1,
+      nextAttemptAt: 1,
+      lockExpiresAt: 1,
+    }),
+    db.collection<EventDoc>('events').createIndex(
+      { workspaceId: 1, seq: 1 },
+      { unique: true }
+    ),
+  ]);
+
+  indexesEnsured = true;
+}
+
+export async function publishWorkspaceEvent(
+  workspaceId: string,
+  type: EventDoc['type'],
+  payload: Record<string, unknown>
+): Promise<{ seq: number; frame: Record<string, unknown> }> {
+  await ensureIndexes();
+  const db = await getDb();
+  const redis = getRedis();
+
+  const seq = await redis.incr(`switchboard:seq:${workspaceId}`);
+  const frame = { seq, type, ...payload };
+
+  await db.collection<EventDoc>('events').insertOne({
+    workspaceId,
+    seq,
+    type,
+    payload,
+  });
+
+  await redis.publish(wsChannel(workspaceId), JSON.stringify(frame));
+  return { seq, frame };
+}
+
+export async function attachWebSocket(
+  ws: WebSocket,
+  workspaceId: string,
+  afterSeq: number
+): Promise<void> {
+  await ensureIndexes();
+  const db = await getDb();
+  const sub = getSubscriber();
+  const channel = wsChannel(workspaceId);
+
+  if (!subscribedChannels.has(channel)) {
+    subscribedChannels.add(channel);
+    await sub.subscribe(channel);
+  }
+
+  const buffer: string[] = [];
+  let flushing = true;
+
+  const onMessage = (ch: string, msg: string) => {
+    if (ch !== channel) return;
+    if (flushing) {
+      buffer.push(msg);
+    } else if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  };
+
+  sub.on('message', onMessage);
+
+  let set = localSubscribers.get(workspaceId);
+  if (!set) {
+    set = new Set();
+    localSubscribers.set(workspaceId, set);
+  }
+  set.add(ws);
+
+  const missed = await db
+    .collection<EventDoc>('events')
+    .find({ workspaceId, seq: { $gt: afterSeq } })
+    .sort({ seq: 1 })
+    .toArray();
+
+  let lastSentSeq = afterSeq;
+  for (const ev of missed) {
+    if (ws.readyState !== WebSocket.OPEN) break;
+    lastSentSeq = Math.max(lastSentSeq, ev.seq);
+    ws.send(JSON.stringify({ seq: ev.seq, type: ev.type, ...(ev.payload || {}) }));
+  }
+
+  for (const raw of buffer) {
+    if (ws.readyState !== WebSocket.OPEN) break;
+    try {
+      const parsed = JSON.parse(raw) as { seq?: number };
+      if (typeof parsed.seq === 'number' && parsed.seq > lastSentSeq) {
+        lastSentSeq = parsed.seq;
+        ws.send(raw);
+      }
+    } catch {
+      ws.send(raw);
+    }
+  }
+  flushing = false;
+
+  ws.on('close', () => {
+    sub.off('message', onMessage);
+    localSubscribers.get(workspaceId)?.delete(ws);
+  });
+}
+
+async function getWorkspaceCooldownRemainingMs(workspaceId: string): Promise<number> {
+  const redis = getRedis();
+  const raw = await redis.get(`switchboard:pigeon_cooldown:${workspaceId}`);
+  if (!raw) return 0;
+  const remaining = Number(raw) - Date.now();
+  return remaining > 0 ? remaining : 0;
+}
+
+async function setWorkspaceCooldown(workspaceId: string, ms: number): Promise<void> {
+  const redis = getRedis();
+  const clamped = Math.min(30_000, Math.max(250, ms));
+  await redis.set(
+    `switchboard:pigeon_cooldown:${workspaceId}`,
+    String(Date.now() + clamped),
+    'PX',
+    clamped + 1000
+  );
+}
+
+async function acquireWorkspaceRateSlot(workspaceId: string): Promise<boolean> {
+  const cooldown = await getWorkspaceCooldownRemainingMs(workspaceId);
+  if (cooldown > 0) return false;
+
+  const redis = getRedis();
+  const bucket = Math.floor(Date.now() / RATE_LIMIT_WINDOW_MS);
+  const key = `switchboard:rl:${workspaceId}:${bucket}`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.pexpire(key, RATE_LIMIT_WINDOW_MS * 2);
+  }
+  return count <= RATE_LIMIT_MAX;
+}
+
+export async function enqueueReply(params: {
+  workspaceId: string;
+  contact: string;
+  text: string;
+  clientRef: string;
+}): Promise<void> {
+  await ensureIndexes();
+  const db = await getDb();
+  const now = new Date();
+
+  await db.collection<ConversationDoc>('conversations').updateOne(
+    { workspaceId: params.workspaceId, contact: params.contact },
+    {
+      $setOnInsert: {
+        workspaceId: params.workspaceId,
+        contact: params.contact,
+        assignee: null,
+        status: 'open',
+      },
+      $set: { lastActivityAt: now },
+    },
+    { upsert: true }
+  );
+
+  await db.collection<OutboundMessageDoc>('outbound_messages').updateOne(
+    { workspaceId: params.workspaceId, clientRef: params.clientRef },
+    {
+      $setOnInsert: {
+        workspaceId: params.workspaceId,
+        contact: params.contact,
+        clientRef: params.clientRef,
+        pigeonMessageId: null,
+        text: params.text,
+        status: 'queued',
+        statusRank: STATUS_RANK.queued,
+        attempts: 0,
+        nextAttemptAt: now,
+        lockedBy: null,
+        lockExpiresAt: null,
+        createdAt: now,
+      },
+    },
+    { upsert: true }
+  );
+}
+
+export async function updateOutboundStatus(params: {
+  workspaceId: string;
+  clientRef?: string;
+  pigeonMessageId?: string;
+  nextStatus: 'queued' | 'sent' | 'delivered' | 'failed';
+  pigeonMsgIdToSave?: string;
+}): Promise<boolean> {
+  await ensureIndexes();
+  const db = await getDb();
+  const col = db.collection<OutboundMessageDoc>('outbound_messages');
+
+  const query: Record<string, unknown> = { workspaceId: params.workspaceId };
+  if (params.clientRef) {
+    query.clientRef = params.clientRef;
+  } else if (params.pigeonMessageId) {
+    query.pigeonMessageId = params.pigeonMessageId;
+  } else {
+    return false;
+  }
+
+  const doc = await col.findOne(query);
+  if (!doc) return false;
+
+  const incomingRank = STATUS_RANK[params.nextStatus];
+  let changed = false;
+  const setFields: Record<string, unknown> = {
+    lockedBy: null,
+    lockExpiresAt: null,
+  };
+
+  if (params.pigeonMsgIdToSave && !doc.pigeonMessageId) {
+    setFields.pigeonMessageId = params.pigeonMsgIdToSave;
+    changed = true;
+  }
+
+  if (incomingRank > doc.statusRank) {
+    setFields.status = params.nextStatus;
+    setFields.statusRank = incomingRank;
+    changed = true;
+  }
+
+  await col.updateOne({ _id: doc._id }, { $set: setFields });
+
+  if (changed) {
+    await publishWorkspaceEvent(params.workspaceId, 'message.status', {
+      contact: doc.contact,
+      client_ref: doc.clientRef,
+      status: incomingRank > doc.statusRank ? params.nextStatus : doc.status,
+    });
+  }
+
+  return true;
+}
+
+async function processOneOutboundJob(): Promise<boolean> {
+  await ensureIndexes();
+  const db = await getDb();
+  const col = db.collection<OutboundMessageDoc>('outbound_messages');
+  const now = new Date();
+  const leaseUntil = new Date(now.getTime() + 25_000);
+
+  const res = await col.findOneAndUpdate(
+    {
+      status: 'queued',
+      nextAttemptAt: { $lte: now },
+      $or: [{ lockExpiresAt: null }, { lockExpiresAt: { $lte: now } }],
+    },
+    {
+      $set: { lockedBy: INSTANCE_ID, lockExpiresAt: leaseUntil },
+      $inc: { attempts: 1 },
+    },
+    { sort: { createdAt: 1 }, returnDocument: 'after' }
+  );
+
+  const job = res;
+  if (!job) return false;
+
+  const cooldownMs = await getWorkspaceCooldownRemainingMs(job.workspaceId);
+  if (cooldownMs > 0) {
+    await col.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          lockedBy: null,
+          lockExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + cooldownMs),
+        },
+        $inc: { attempts: -1 },
+      }
+    );
+    return false;
+  }
+
+  const slotOk = await acquireWorkspaceRateSlot(job.workspaceId);
+  if (!slotOk) {
+    await col.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          lockedBy: null,
+          lockExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + 250 + Math.floor(Math.random() * 250)),
+        },
+        $inc: { attempts: -1 },
+      }
+    );
+    return false;
+  }
+
+  const apiKey = config.pigeon.apiKeys[job.workspaceId];
+  if (!apiKey) {
+    await updateOutboundStatus({
+      workspaceId: job.workspaceId,
+      clientRef: job.clientRef,
+      nextStatus: 'failed',
+    });
+    return true;
+  }
+
+  try {
+    const response = await fetch(`${config.pigeon.url.replace(/\/+$/, '')}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'Idempotency-Key': job.clientRef,
+      },
+      body: JSON.stringify({
+        to: job.contact,
+        text: job.text,
+        client_ref: job.clientRef,
+      }),
+      signal: AbortSignal.timeout(5500),
+    });
+
+    if (response.ok) {
+      let pigeonId: string | undefined;
+      try {
+        const json = (await response.json()) as { id?: string };
+        if (json?.id) pigeonId = String(json.id);
+      } catch {
+        // ignore parse failure on 200
+      }
+
+      await updateOutboundStatus({
+        workspaceId: job.workspaceId,
+        clientRef: job.clientRef,
+        nextStatus: 'sent',
+        pigeonMsgIdToSave: pigeonId,
+      });
+      return true;
+    }
+
+    if (response.status === 429) {
+      const retryAfterHeader = response.headers.get('retry-after');
+      const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : 1;
+      const delayMs =
+        Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : 1000;
+      await setWorkspaceCooldown(job.workspaceId, delayMs);
+      await col.updateOne(
+        { _id: job._id },
+        {
+          $set: {
+            lockedBy: null,
+            lockExpiresAt: null,
+            nextAttemptAt: new Date(Date.now() + delayMs + Math.floor(Math.random() * 200)),
+          },
+        }
+      );
+      return true;
+    }
+
+    if (response.status >= 400 && response.status < 500) {
+      await updateOutboundStatus({
+        workspaceId: job.workspaceId,
+        clientRef: job.clientRef,
+        nextStatus: 'failed',
+      });
+      return true;
+    }
+
+    const backoffMs =
+      Math.min(6000, 350 * Math.pow(1.5, Math.min(job.attempts, 7))) +
+      Math.floor(Math.random() * 200);
+    await col.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          lockedBy: null,
+          lockExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + backoffMs),
+        },
+      }
+    );
+    return true;
+  } catch {
+    const backoffMs =
+      Math.min(6000, 400 * Math.pow(1.5, Math.min(job.attempts, 7))) +
+      Math.floor(Math.random() * 200);
+    await col.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          lockedBy: null,
+          lockExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + backoffMs),
+        },
+      }
+    );
+    return true;
+  }
+}
+
+let timer: ReturnType<typeof setInterval> | null = null;
+let ticking = false;
+
+export function startOutboundWorker(): void {
+  if (timer) return;
+  const runTick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      for (let i = 0; i < 8; i++) {
+        const worked = await processOneOutboundJob();
+        if (!worked) break;
+      }
+    } finally {
+      ticking = false;
+    }
+  };
+  timer = setInterval(runTick, 100);
+  runTick().catch(() => {});
+}
+
+```
+
+#### `scaffold/server/src/index.ts`
+
+```ts
+import crypto from 'node:crypto';
+import { createServer } from 'node:http';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { WebSocketServer } from 'ws';
+import { config } from './config.js';
+import { getDb } from './db.js';
+import { getRedis } from './redis.js';
+import {
+  attachWebSocket,
+  enqueueReply,
+  ensureIndexes,
+  publishWorkspaceEvent,
+  startOutboundWorker,
+  updateOutboundStatus,
+} from './store.js';
+import type {
+  ConversationDoc,
+  EventDoc,
+  InboundMessageDoc,
+  OutboundMessageDoc,
+  SessionPayload,
+} from './types.js';
+
+const SESSION_COOKIE = 'sb_session';
+const SESSION_SECRET = crypto
+  .createHash('sha256')
+  .update(`${config.graderToken}:${config.oidc.clientSecret}`)
+  .digest('hex');
+
+const app = express();
+
+type RequestWithRawBody = Request & { rawBody?: Buffer; session?: SessionPayload };
+
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as RequestWithRawBody).rawBody = buf;
+    },
+  })
+);
+
+// Malformed JSON -> always 400, never 5xx
+app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof SyntaxError && 'status' in err && (err as { status?: number }).status === 400) {
+    res.status(400).json({ error: 'invalid_json' });
+    return;
+  }
+  next(err);
+});
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+function signSession(payload: SessionPayload): string {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function verifySessionToken(token: string | undefined): SessionPayload | null {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  try {
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionPayload;
+    if (!parsed.sub || !Array.isArray(parsed.workspaces)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function readSession(req: Request): SessionPayload | null {
+  const cookies = parseCookies(req.headers.cookie);
+  return verifySessionToken(cookies[SESSION_COOKIE]);
+}
+
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const session = readSession(req);
+  if (!session) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+  (req as RequestWithRawBody).session = session;
+  next();
+}
+
+function requireWorkspaceMember(req: Request, res: Response, workspaceId: string): boolean {
+  const session = (req as RequestWithRawBody).session;
+  if (!session) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  }
+  if (!session.workspaces.some((w) => w.id === workspaceId)) {
+    res.status(403).json({ error: 'forbidden' });
+    return false;
+  }
+  return true;
+}
+
+function requireGrader(req: Request, res: Response, next: NextFunction): void {
+  const token = String(req.headers['x-grader-token'] || '');
+  if (!config.graderToken || token !== config.graderToken) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+  next();
+}
+
+app.get('/healthz', async (_req, res) => {
+  try {
+    await getRedis().ping();
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+
+// OIDC Authorization Code + PKCE (S256)
+app.get('/auth/login', async (_req, res) => {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  const state = crypto.randomBytes(16).toString('hex');
+
+  await getRedis().set(`switchboard:pkce:${state}`, verifier, 'EX', 600);
+
+  const authUrl = new URL(`${config.oidc.issuer.replace(/\/+$/, '')}/authorize`);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('client_id', config.oidc.clientId);
+  authUrl.searchParams.set('redirect_uri', config.oidc.redirectUri);
+  authUrl.searchParams.set('scope', 'openid profile email');
+  authUrl.searchParams.set('state', state);
+  authUrl.searchParams.set('code_challenge', challenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+
+  res.redirect(authUrl.toString());
+});
+
+app.get('/auth/callback', async (req, res) => {
+  const code = String(req.query.code || '');
+  const state = String(req.query.state || '');
+  if (!code || !state) {
+    res.status(400).send('Missing code or state');
+    return;
+  }
+
+  const redis = getRedis();
+  const verifier = await redis.get(`switchboard:pkce:${state}`);
+  if (!verifier) {
+    res.status(400).send('Invalid or expired state');
+    return;
+  }
+  await redis.del(`switchboard:pkce:${state}`);
+
+  const tokenRes = await fetch(`${config.oidc.issuer.replace(/\/+$/, '')}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      client_id: config.oidc.clientId,
+      client_secret: config.oidc.clientSecret,
+      redirect_uri: config.oidc.redirectUri,
+      code_verifier: verifier,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    res.status(502).send('Token exchange failed');
+    return;
+  }
+
+  const tokenPayload = (await tokenRes.json()) as { id_token?: string; access_token?: string };
+  const jwt = tokenPayload.id_token || tokenPayload.access_token || '';
+  const jwtParts = jwt.split('.');
+  if (jwtParts.length < 2) {
+    res.status(502).send('Malformed JWT');
+    return;
+  }
+
+  const claims = JSON.parse(Buffer.from(jwtParts[1], 'base64url').toString('utf8')) as {
+    sub?: string;
+    workspaces?: WorkspaceRole[];
+  };
+
+  if (!claims.sub) {
+    res.status(502).send('Missing sub claim');
+    return;
+  }
+
+  const session: SessionPayload = {
+    sub: claims.sub,
+    workspaces: Array.isArray(claims.workspaces) ? claims.workspaces : [],
+  };
+
+  res.cookie(SESSION_COOKIE, signSession(session), {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/',
+  });
+
+  res.redirect(`${config.webOrigin.replace(/\/+$/, '')}/`);
+});
+
+app.get('/api/me', requireAuth, (req, res) => {
+  const session = (req as RequestWithRawBody).session!;
+  res.json(session);
+});
+
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  const workspaceId = String(req.query.workspace || '');
+  if (!workspaceId) {
+    res.status(400).json({ error: 'workspace is required' });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  await ensureIndexes();
+  const db = await getDb();
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || '50') || 50));
+  const offset = Math.max(0, Number(req.query.offset || '0') || 0);
+
+  const conversations = await db
+    .collection<ConversationDoc>('conversations')
+    .find({ workspaceId })
+    .sort({ lastActivityAt: -1 })
+    .skip(offset)
+    .limit(limit)
+    .toArray();
+
+  res.json({ conversations });
+});
+
+app.get('/api/conversations/:contact/messages', requireAuth, async (req, res) => {
+  const workspaceId = String(req.query.workspace || '');
+  const contact = decodeURIComponent(String(req.params.contact || ''));
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: 'workspace and contact are required' });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  await ensureIndexes();
+  const db = await getDb();
+  const [inbound, outbound] = await Promise.all([
+    db
+      .collection<InboundMessageDoc>('inbound_messages')
+      .find({ workspaceId, contact })
+      .sort({ sortOrder: 1 })
+      .toArray(),
+    db
+      .collection<OutboundMessageDoc>('outbound_messages')
+      .find({ workspaceId, contact })
+      .sort({ createdAt: 1 })
+      .toArray(),
+  ]);
+
+  res.json({ inbound, outbound });
+});
+
+async function claimConversation(
+  workspaceId: string,
+  contact: string,
+  agent: string
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  await ensureIndexes();
+  const db = await getDb();
+  const col = db.collection<ConversationDoc>('conversations');
+  const now = new Date();
+
+  await col.updateOne(
+    { workspaceId, contact },
+    {
+      $setOnInsert: { workspaceId, contact, assignee: null, status: 'open', lastActivityAt: now },
+    },
+    { upsert: true }
+  );
+
+  const claimed = await col.findOneAndUpdate(
+    {
+      workspaceId,
+      contact,
+      assignee: { $in: [null, agent] },
+    },
+    {
+      $set: { assignee: agent, status: 'open', lastActivityAt: now },
+    },
+    { returnDocument: 'after' }
+  );
+
+  if (!claimed) {
+    const existing = await col.findOne({ workspaceId, contact });
+    return {
+      status: 409,
+      body: { error: 'already_claimed', assignee: existing?.assignee ?? null },
+    };
+  }
+
+  await publishWorkspaceEvent(workspaceId, 'conversation.assigned', {
+    contact,
+    assignee: agent,
+  });
+
+  return {
+    status: 200,
+    body: { contact, assignee: claimed.assignee, status: claimed.status },
+  };
+}
+
+app.post('/api/conversations/:contact/claim', requireAuth, async (req, res) => {
+  const session = (req as RequestWithRawBody).session!;
+  const workspaceId = String(req.body?.workspace || req.query.workspace || '');
+  const contact = decodeURIComponent(String(req.params.contact || ''));
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: 'workspace and contact are required' });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  const result = await claimConversation(workspaceId, contact, session.sub);
+  res.status(result.status).json(result.body);
+});
+
+app.post('/api/conversations/:contact/status', requireAuth, async (req, res) => {
+  const workspaceId = String(req.body?.workspace || '');
+  const contact = decodeURIComponent(String(req.params.contact || ''));
+  const status: 'open' | 'closed' = req.body?.status === 'closed' ? 'closed' : 'open';
+  if (!workspaceId || !contact) {
+    res.status(400).json({ error: 'workspace and contact are required' });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  await ensureIndexes();
+  const db = await getDb();
+  const now = new Date();
+  await db.collection<ConversationDoc>('conversations').updateOne(
+    { workspaceId, contact },
+    {
+      $setOnInsert: { workspaceId, contact, assignee: null },
+      $set: { status, lastActivityAt: now },
+    },
+    { upsert: true }
+  );
+
+  res.json({ contact, status });
+});
+
+app.post('/api/replies', requireAuth, async (req, res) => {
+  const workspaceId = String(req.body?.workspace || '');
+  const contact = String(req.body?.contact || '');
+  const text = String(req.body?.text || '');
+  const clientRef = String(req.body?.client_ref || crypto.randomUUID());
+
+  if (!workspaceId || !contact || !text) {
+    res.status(400).json({ error: 'workspace, contact, and text are required' });
+    return;
+  }
+  if (!requireWorkspaceMember(req, res, workspaceId)) return;
+
+  await enqueueReply({ workspaceId, contact, text, clientRef });
+  res.status(202).json({ accepted: true, client_ref: clientRef });
+});
+
+// Pigeon webhook signature verification: x-pigeon-signature: t=<sec>,v1=<hex> over "<t>.<raw body>"
+function verifyPigeonSignature(req: RequestWithRawBody): boolean {
+  const sigHeader = req.headers['x-pigeon-signature'];
+  if (!sigHeader || typeof sigHeader !== 'string' || !req.rawBody) return false;
+
+  let tPart = '';
+  let v1Part = '';
+  for (const piece of sigHeader.split(',')) {
+    const trimmed = piece.trim();
+    if (trimmed.startsWith('t=')) tPart = trimmed.slice(2);
+    else if (trimmed.startsWith('v1=')) v1Part = trimmed.slice(3);
+  }
+
+  const tsSec = Number(tPart);
+  if (!tPart || !v1Part || !Number.isFinite(tsSec)) return false;
+
+  // Reject timestamps more than 5 minutes (300s) old
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - tsSec) > 300) return false;
+
+  const expectedHex = crypto
+    .createHmac('sha256', config.pigeon.webhookSecret)
+    .update(`${tPart}.${req.rawBody.toString('utf8')}`)
+    .digest('hex');
+
+  try {
+    const actualBuf = Buffer.from(v1Part, 'hex');
+    const expectedBuf = Buffer.from(expectedHex, 'hex');
+    if (actualBuf.length === 0 || actualBuf.length !== expectedBuf.length) return false;
+    return crypto.timingSafeEqual(actualBuf, expectedBuf);
+  } catch {
+    return false;
+  }
+}
+
+app.post('/webhooks/pigeon', async (req, res) => {
+  const typedReq = req as RequestWithRawBody;
+  if (!verifyPigeonSignature(typedReq)) {
+    res.status(401).json({ error: 'invalid_signature' });
+    return;
+  }
+
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    res.status(400).json({ error: 'invalid_body' });
+    return;
+  }
+
+  const body = req.body as Record<string, unknown>;
+  const workspaceId = typeof body.workspace === 'string' ? body.workspace : '';
+  const type = typeof body.type === 'string' ? body.type : '';
+  const data =
+    body.data && typeof body.data === 'object' && !Array.isArray(body.data)
+      ? (body.data as Record<string, unknown>)
+      : {};
+
+  // Unknown workspace -> 2xx and ignore per PIGEON.md
+  if (!workspaceId || !Object.prototype.hasOwnProperty.call(config.pigeon.apiKeys, workspaceId)) {
+    res.status(200).json({ ok: true, ignored: 'unknown_workspace' });
+    return;
+  }
+
+  await ensureIndexes();
+  const db = await getDb();
+
+  if (type === 'message.inbound') {
+    const messageId = typeof data.message_id === 'string' ? data.message_id : '';
+    const contact = typeof data.from === 'string' ? data.from : '';
+    const text = typeof data.text === 'string' ? data.text : '';
+
+    if (!messageId || !contact) {
+      res.status(400).json({ error: 'missing_inbound_fields' });
+      return;
+    }
+
+    const occurredAtParsed =
+      typeof body.occurred_at === 'string' ? Date.parse(body.occurred_at) : NaN;
+    const occurredAt = Number.isFinite(occurredAtParsed) ? new Date(occurredAtParsed) : new Date();
+    const sortOrder = occurredAt.getTime();
+
+    const inboundCol = db.collection<InboundMessageDoc>('inbound_messages');
+    const existing = await inboundCol.findOne({ workspaceId, messageId });
+    if (!existing) {
+      try {
+        await inboundCol.insertOne({
+          workspaceId,
+          contact,
+          messageId,
+          text,
+          occurredAt,
+          sortOrder,
+        });
+      } catch (err: unknown) {
+        if ((err as { code?: number })?.code !== 11000) {
+          throw err;
+        }
+      }
+
+      await db.collection<ConversationDoc>('conversations').updateOne(
+        { workspaceId, contact },
+        {
+          $setOnInsert: { workspaceId, contact, assignee: null, status: 'open' },
+          $max: { lastActivityAt: occurredAt },
+        },
+        { upsert: true }
+      );
+
+      await publishWorkspaceEvent(workspaceId, 'message.inbound', {
+        contact,
+        message_id: messageId,
+        text,
+      });
+    }
+
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  if (type === 'message.status') {
+    const clientRef = typeof data.client_ref === 'string' ? data.client_ref : undefined;
+    const pigeonMessageId = typeof data.message_id === 'string' ? data.message_id : undefined;
+    const rawStatus = typeof data.status === 'string' ? data.status.toLowerCase() : '';
+
+    if (rawStatus !== 'sent' && rawStatus !== 'delivered' && rawStatus !== 'failed') {
+      res.status(200).json({ ok: true, ignored: 'unknown_status' });
+      return;
+    }
+
+    await updateOutboundStatus({
+      workspaceId,
+      clientRef,
+      pigeonMessageId,
+      nextStatus: rawStatus,
+      pigeonMsgIdToSave: pigeonMessageId,
+    });
+
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  // Unknown event type -> 2xx per PIGEON.md
+  res.status(200).json({ ok: true, ignored: 'unknown_event_type' });
+});
+
+// Grader contract endpoints
+app.post('/__grader/reset', requireGrader, async (_req, res) => {
+  await ensureIndexes();
+  const db = await getDb();
+
+  await Promise.all([
+    db.collection('conversations').deleteMany({}),
+    db.collection('inbound_messages').deleteMany({}),
+    db.collection('outbound_messages').deleteMany({}),
+    db.collection('events').deleteMany({}),
+  ]);
+
+  const redis = getRedis();
+  const keys = await redis.keys('switchboard:*');
+  const appKeys = keys.filter((k) => !k.startsWith('switchboard:pkce:'));
+  if (appKeys.length > 0) {
+    await redis.del(appKeys);
+  }
+
+  res.status(200).json({ ok: true });
+});
+
+app.get('/__grader/snapshot', requireGrader, async (_req, res) => {
+  await ensureIndexes();
+  const db = await getDb();
+
+  const [conversations, inboundMessages, outboundMessages] = await Promise.all([
+    db.collection<ConversationDoc>('conversations').find({}).toArray(),
+    db.collection<InboundMessageDoc>('inbound_messages').find({}).sort({ sortOrder: 1, _id: 1 }).toArray(),
+    db.collection<OutboundMessageDoc>('outbound_messages').find({}).toArray(),
+  ]);
+
+  const workspaces: Record<
+    string,
+    {
+      contacts: Record<string, { inbound: string[]; assignee: string | null }>;
+      outbound: Record<string, string>;
+    }
+  > = {};
+
+  const getOrCreateWs = (wsId: string) => {
+    if (!workspaces[wsId]) {
+      workspaces[wsId] = { contacts: {}, outbound: {} };
+    }
+    return workspaces[wsId];
+  };
+
+  for (const conv of conversations) {
+    const ws = getOrCreateWs(conv.workspaceId);
+    if (!ws.contacts[conv.contact]) {
+      ws.contacts[conv.contact] = { inbound: [], assignee: conv.assignee ?? null };
+    } else {
+      ws.contacts[conv.contact].assignee = conv.assignee ?? null;
+    }
+  }
+
+  for (const msg of inboundMessages) {
+    const ws = getOrCreateWs(msg.workspaceId);
+    if (!ws.contacts[msg.contact]) {
+      ws.contacts[msg.contact] = { inbound: [], assignee: null };
+    }
+    ws.contacts[msg.contact].inbound.push(msg.messageId);
+  }
+
+  for (const out of outboundMessages) {
+    const ws = getOrCreateWs(out.workspaceId);
+    ws.outbound[out.clientRef] = out.status;
+  }
+
+  res.status(200).json({ workspaces });
+});
+
+app.post('/__grader/reply', requireGrader, async (req, res) => {
+  const workspace = String(req.body?.workspace || '');
+  const contact = String(req.body?.contact || '');
+  const text = String(req.body?.text || '');
+  const clientRef = String(req.body?.client_ref || '');
+
+  if (!workspace || !contact || !text || !clientRef) {
+    res.status(400).json({ error: 'missing_fields' });
+    return;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(config.pigeon.apiKeys, workspace)) {
+    res.status(404).json({ error: 'unknown_workspace' });
+    return;
+  }
+
+  await enqueueReply({ workspaceId: workspace, contact, text, clientRef });
+  res.status(202).json({ accepted: true, client_ref: clientRef });
+});
+
+app.post('/__grader/claim', requireGrader, async (req, res) => {
+  const workspace = String(req.body?.workspace || '');
+  const contact = String(req.body?.contact || '');
+  const agent = String(req.body?.agent || '');
+
+  if (!workspace || !contact || !agent) {
+    res.status(400).json({ error: 'missing_fields' });
+    return;
+  }
+
+  const result = await claimConversation(workspace, contact, agent);
+  res.status(result.status).json(result.body);
+});
+
+const server = createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  if (url.pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const cookies = parseCookies(req.headers.cookie);
+  const session = verifySessionToken(cookies[SESSION_COOKIE]);
+  const workspaceId = url.searchParams.get('workspace') || '';
+  const afterSeq = Math.max(0, Number(url.searchParams.get('after') || '0') || 0);
+
+  if (!session) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  if (!workspaceId || !session.workspaces.some((w) => w.id === workspaceId)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    attachWebSocket(ws, workspaceId, afterSeq).catch(() => ws.close());
+  });
+});
+
+async function start(): Promise<void> {
+  await ensureIndexes();
+  startOutboundWorker();
+  server.listen(config.port, () => {
+    console.log(`server on http://localhost:${config.port}`);
+  });
+}
+
+start().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
+
+```
+
+---
+
+### 2. Frontend (`scaffold/web/src/App.tsx`)
+
+```tsx
+import { useEffect, useRef, useState } from 'react';
+
+interface WorkspaceRole {
+  id: string;
+  role: 'admin' | 'agent';
+}
+
+interface MeResponse {
+  sub: string;
+  workspaces: WorkspaceRole[];
+}
+
+interface ConversationItem {
+  workspaceId: string;
+  contact: string;
+  assignee: string | null;
+  status: 'open' | 'closed';
+  lastActivityAt: string;
+}
+
+interface InboundItem {
+  messageId: string;
+  text: string;
+  sortOrder: number;
+}
+
+interface OutboundItem {
+  clientRef: string;
+  text: string;
+  status: 'queued' | 'sent' | 'delivered' | 'failed';
+}
+
+export function App() {
+  const [me, setMe] = useState<MeResponse | null>(null);
+  const [loadingMe, setLoadingMe] = useState(true);
+  const [workspaceId, setWorkspaceId] = useState('');
+  const [conversations, setConversations] = useState<ConversationItem[]>([]);
+  const [selectedContact, setSelectedContact] = useState('');
+  const [inbound, setInbound] = useState<InboundItem[]>([]);
+  const [outbound, setOutbound] = useState<OutboundItem[]>([]);
+  const [replyText, setReplyText] = useState('');
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const lastSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    fetch('/api/me', { credentials: 'include' })
+      .then(async (res) => (res.ok ? ((await res.json()) as MeResponse) : null))
+      .then((user) => {
+        setMe(user);
+        if (user?.workspaces?.length) {
+          setWorkspaceId(user.workspaces[0].id);
+        }
+      })
+      .finally(() => setLoadingMe(false));
+  }, []);
+
+  async function refreshConversations(ws: string) {
+    const res = await fetch(`/api/conversations?workspace=${encodeURIComponent(ws)}`, {
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      setNotice(`Unable to load conversations (${res.status})`);
+      return;
+    }
+    const data = (await res.json()) as { conversations: ConversationItem[] };
+    setConversations(data.conversations || []);
+  }
+
+  async function refreshMessages(ws: string, contact: string) {
+    const res = await fetch(
+      `/api/conversations/${encodeURIComponent(contact)}/messages?workspace=${encodeURIComponent(ws)}`,
+      { credentials: 'include' }
+    );
+    if (!res.ok) return;
+    const data = (await res.json()) as { inbound: InboundItem[]; outbound: OutboundItem[] };
+    setInbound(data.inbound || []);
+    setOutbound(data.outbound || []);
+  }
+
+  useEffect(() => {
+    if (!workspaceId) return;
+    lastSeqRef.current = 0;
+    setNotice(null);
+    refreshConversations(workspaceId);
+    if (selectedContact) {
+      refreshMessages(workspaceId, selectedContact);
+    }
+
+    let closedByCleanup = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let socket: WebSocket | null = null;
+
+    const connect = () => {
+      if (closedByCleanup) return;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${proto}//${window.location.host}/ws?workspace=${encodeURIComponent(
+        workspaceId
+      )}&after=${lastSeqRef.current}`;
+
+      socket = new WebSocket(url);
+      socket.onmessage = (event) => {
+        try {
+          const frame = JSON.parse(event.data) as {
+            seq?: number;
+            type?: string;
+            contact?: string;
+            client_ref?: string;
+            status?: OutboundItem['status'];
+            assignee?: string | null;
+          };
+          if (typeof frame.seq === 'number' && frame.seq > lastSeqRef.current) {
+            lastSeqRef.current = frame.seq;
+          }
+          if (frame.type === 'message.inbound') {
+            refreshConversations(workspaceId);
+            if (frame.contact === selectedContact) {
+              refreshMessages(workspaceId, selectedContact);
+            }
+          } else if (frame.type === 'message.status' && frame.client_ref && frame.status) {
+            setOutbound((prev) =>
+              prev.map((m) =>
+                m.clientRef === frame.client_ref ? { ...m, status: frame.status! } : m
+              )
+            );
+          } else if (frame.type === 'conversation.assigned' && frame.contact) {
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.contact === frame.contact ? { ...c, assignee: frame.assignee ?? null } : c
+              )
+            );
+          }
+        } catch {
+          // ignore malformed frames
+        }
+      };
+
+      socket.onclose = () => {
+        if (!closedByCleanup) {
+          reconnectTimer = setTimeout(connect, 1000);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      closedByCleanup = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [workspaceId, selectedContact]);
+
+  async function onClaim(contact: string) {
+    setNotice(null);
+    const res = await fetch(`/api/conversations/${encodeURIComponent(contact)}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ workspace: workspaceId }),
+    });
+    if (res.status === 409) {
+      const data = (await res.json().catch(() => ({}))) as { assignee?: string | null };
+      setNotice(`Already claimed by ${data.assignee || 'another agent'}`);
+    }
+    await refreshConversations(workspaceId);
+  }
+
+  async function onToggleStatus(contact: string, current: 'open' | 'closed') {
+    const next = current === 'open' ? 'closed' : 'open';
+    await fetch(`/api/conversations/${encodeURIComponent(contact)}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ workspace: workspaceId, status: next }),
+    });
+    await refreshConversations(workspaceId);
+  }
+
+  async function onSend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!selectedContact || !replyText.trim()) return;
+    const text = replyText.trim();
+    const clientRef = `ref_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    setReplyText('');
+
+    setOutbound((prev) => [...prev, { clientRef, text, status: 'queued' }]);
+
+    await fetch('/api/replies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        workspace: workspaceId,
+        contact: selectedContact,
+        text,
+        client_ref: clientRef,
+      }),
+    });
+  }
+
+  if (loadingMe) {
+    return <main style={{ padding: 24, fontFamily: 'system-ui' }}>Loading…</main>;
+  }
+
+  if (!me) {
+    return (
+      <main style={{ padding: 32, fontFamily: 'system-ui', maxWidth: 520, margin: '64px auto' }}>
+        <h1>Switchboard</h1>
+        <p>Sign in with the Mock IdP to open your workspace inbox.</p>
+        <a href="/auth/login">Sign in with IdP</a>
+      </main>
+    );
+  }
+
+  const activeConversation = conversations.find((c) => c.contact === selectedContact) || null;
+
+  return (
+    <div style={{ display: 'flex', height: '100vh', fontFamily: 'system-ui' }}>
+      <aside style={{ width: 320, borderRight: '1px solid #e5e7eb', padding: 16, overflowY: 'auto' }}>
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontWeight: 600 }}>{me.sub}</div>
+          <select
+            value={workspaceId}
+            onChange={(e) => {
+              setSelectedContact('');
+              setWorkspaceId(e.target.value);
+            }}
+            style={{ marginTop: 8, padding: 6 }}
+          >
+            {me.workspaces.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.id} ({w.role})
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {notice && (
+          <div style={{ color: '#b91c1c', fontSize: 13, marginBottom: 10 }}>{notice}</div>
+        )}
+
+        {conversations.map((conv) => (
+          <div
+            key={conv.contact}
+            onClick={() => setSelectedContact(conv.contact)}
+            style={{
+              padding: 10,
+              borderRadius: 6,
+              marginBottom: 6,
+              cursor: 'pointer',
+              background: conv.contact === selectedContact ? '#eef2ff' : '#f9fafb',
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>{conv.contact}</div>
+            <div style={{ fontSize: 12, color: '#4b5563' }}>
+              {conv.assignee ? `Claimed: ${conv.assignee}` : 'Unassigned'} · {conv.status}
+            </div>
+          </div>
+        ))}
+      </aside>
+
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: 16 }}>
+        {!selectedContact ? (
+          <div style={{ color: '#6b7280' }}>Select a conversation to view messages and reply.</div>
+        ) : (
+          <>
+            <header
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: 12,
+                borderBottom: '1px solid #e5e7eb',
+              }}
+            >
+              <div>
+                <h2 style={{ margin: 0 }}>{selectedContact}</h2>
+                <small style={{ color: '#4b5563' }}>
+                  Assignee: {activeConversation?.assignee || 'Unassigned'} · Status:{' '}
+                  {activeConversation?.status || 'open'}
+                </small>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" onClick={() => onClaim(selectedContact)}>
+                  Claim
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onToggleStatus(selectedContact, activeConversation?.status || 'open')
+                  }
+                >
+                  {activeConversation?.status === 'closed' ? 'Reopen' : 'Close'}
+                </button>
+              </div>
+            </header>
+
+            <section
+              style={{
+                flex: 1,
+                overflowY: 'auto',
+                padding: '12px 0',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+              }}
+            >
+              {inbound.map((m) => (
+                <div
+                  key={m.messageId}
+                  style={{
+                    alignSelf: 'flex-start',
+                    background: '#f3f4f6',
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                  }}
+                >
+                  <div>{m.text}</div>
+                  <small style={{ color: '#6b7280' }}>Customer · {m.messageId}</small>
+                </div>
+              ))}
+              {outbound.map((m) => (
+                <div
+                  key={m.clientRef}
+                  style={{
+                    alignSelf: 'flex-end',
+                    background: '#dbeafe',
+                    padding: '8px 12px',
+                    borderRadius: 8,
+                  }}
+                >
+                  <div>{m.text}</div>
+                  <small style={{ color: '#1e40af' }}>Agent · {m.status}</small>
+                </div>
+              ))}
+            </section>
+
+            <form onSubmit={onSend} style={{ display: 'flex', gap: 8 }}>
+              <input
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                placeholder="Write a reply…"
+                style={{ flex: 1, padding: 8 }}
+              />
+              <button type="submit">Send</button>
+            </form>
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+```
+
+---
+
+### 3. Typecheck & Run Order
+
+Run from `scaffold/server` first to verify zero TypeScript errors:
+
+```bash
+npm --prefix scaffold/server run typecheck
+
+```
+
+Then follow the check order in the brief (with your manual dev server stopped):
+
+1. `npm run check` (Level 1)
+2. `npm run check -- --levels 5` (Level 5)
+3. `npm run check:full` (Levels 1, 2, 3, and 5 -> writes `CHECK_REPORT.json`)
+
+Want to run `npm run check` next and share any output if something needs adjustment?
+
+Mitul@Mitul_Vic MINGW64 ~/OneDrive/Desktop/GoGHL.ai/starter (main)
+$ npm run check
+npm notice run check
+npm notice run node harness/check.js
+Switchboard check, profile "quick". Your server is started from switchboard.json; logs go to .check-logs/
+
+Level 1: one instance, a bad network
+  PASS  4/4     inbound_complete            176 of 176 genuine messages stored
+  PASS  3/3     inbound_no_duplicates       0 duplicate entries
+  PASS  3/3     inbound_order               0 out-of-order positions (by occurred_at)
+  PASS  2/2     isolation                   0 messages under the wrong workspace or contact, or forged/replayed ids stored
+  PASS  2/2     rejects_forged              0 of 6 forged webhooks accepted
+  PASS  1/1     rejects_stale               0 of 3 replayed webhooks accepted
+  PASS  1/1     ack_speed                   p95 acknowledgement 12 ms, 0 first attempts not acknowledged
+  PASS  2/2     outbound_exactly_once       12 of 12 replies reached the carrier, 0 more than once, 0 requests without Idempotency-Key
+  PASS  1/1     honours_retry_after         0 requests sent inside a Retry-After window
+  PASS  1/1     status_lifecycle            12 of 12 final statuses match the carrier
+  PASS  2/2     claim_atomic                5 of 5 conversations had exactly one winner out of six, 0 had several, 0 had none; snapshot assignee correct for 5
+  PASS  2/2     outage_recovery             6 of 6 replies requested during a 8 s provider outage were delivered afterwards, 0 more than once; 30 requests made during the outage
+
+Score 24 of 24   level 1: 24/24
+The trickle of customer messages is off after a check. Turn it back on with: npm run drizzle
+
+answer after level 1 check
+
+Level 1 came back **24/24**—176/176 inbound messages stored with zero duplicates, zero order inversions, and 12 ms p95 acks; forged and stale webhooks rejected; 12/12 replies delivered once with `Retry-After` honoured; 5/5 atomic claims won cleanly; and 6/6 outage replies delivered after the 8 s outage.
+
+Next, follow the recommended order (**1 -> 5 -> 2 -> 3**) and run Level 5 on its own:
+
+```bash
+npm run check -- --levels 5
+
+```
+
+Level 5 tests browser-style OIDC PKCE sign-in (`/auth/login`, `/auth/callback`, `/api/me`), `401`/`403` workspace isolation on `/api/conversations` and `/ws`, live WebSocket delivery across instances, and `?after=<seq>` replay.
+
+Run that next and share the output—or tell me if you want to test the React UI or move straight to Levels 2 and 3.
+
+
+Mitul@Mitul_Vic MINGW64 ~/OneDrive/Desktop/GoGHL.ai/starter (main)
+$ npm run check -- --levels 5
+npm notice run check
+npm notice run node harness/check.js --levels 5
+Switchboard check, profile "quick". Your server is started from switchboard.json; logs go to .check-logs/
+
+Level 5: login, tenant isolation and real time, 2 instances
+  PASS  3/3     login                       signed in as u_ben through the IdP; GET /api/me is correct
+  PASS  1/1     me_needs_session            GET /api/me without a session: 401 (want 401)
+  PASS  3/3     api_tenant_isolation        GET /api/conversations as u_ben: own workspace 200 (want 200), another workspace 403 (want 403), no session 401 (want 401)
+  PASS  2/2     socket_refuses_strangers    WebSocket /ws without a session: refused; as u_ben for ws_globex: refused
+  PART  2/3     socket_live                 6 of 6 new messages arrived on the socket within 5 s; 0 frames from another workspace; seq NOT increasing
+  PASS  3/3     socket_replay               4 of 4 messages that arrived while disconnected were replayed after reconnecting with after=6; 0 frames at or before that seq were sent again
+
+Score 14 of 15   level 5: 14/15
+The trickle of customer messages is off after a check. Turn it back on with: npm run drizzle
+
+Mitul@Mitul_Vic MINGW64 ~/OneDrive/Desktop/GoGHL.ai/starter (main)
+$ npm run check -- --levels 2
+npm notice run check
+npm notice run node harness/check.js --levels 2
+Switchboard check, profile "quick". Your server is started from switchboard.json; logs go to .check-logs/
+
+Level 2: one instance, killed without warning and started again
+
+STOPPED: GET /__grader/snapshot returned 502
+
+Score 0 of 14   level 2: 0/14
+The trickle of customer messages is off after a check. Turn it back on with: npm run drizzle
+
+Mitul@Mitul_Vic MINGW64 ~/OneDrive/Desktop/GoGHL.ai/starter (main)
+$ npm run check -- --levels 3
+npm notice run check
+npm notice run node harness/check.js --levels 3
+Switchboard check, profile "quick". Your server is started from switchboard.json; logs go to .check-logs/
+
+Level 3: 2 instances behind a load balancer
+
+STOPPED: GET /__grader/snapshot returned 502
+
+Score 0 of 22   level 3: 0/22
+The trickle of customer messages is off after a check. Turn it back on with: npm run drizzle
+
+these are the results for the rest of the tests
+
+Level 5 is at **14/15**—login, `401`/`403` isolation, socket auth refusal, live delivery, and replay all work. The two issues to fix right now are:
+
+1. **`seq NOT increasing` in Level 5 (`PART 2/3`):** Look at `check.js`:
+`const rising = seqs.every((v, i) => i === 0 || v > seqs[i - 1]);`
+In `store.ts`, `publishWorkspaceEvent` calls `await redis.incr(...)`, inserts into Mongo, and then calls `await redis.publish(...)`. Under concurrent events across multiple server instances, two async calls can finish `redis.publish` in reverse order of their `seq` numbers (e.g., `seq: 3` arrives on the socket before `seq: 2`), breaking strict `f.seq > prev.seq` arrival order on the client.
+2. **`STOPPED: GET /__grader/snapshot returned 502` in Levels 2 and 3:** Look at `check.js`'s `startBalancer()` and `killInstance()`:
+`check.js` spawns `sh -c <manifest.start>` in a detached process group and kills it with `SIGKILL` (`process.kill(-inst.child.pid, 'SIGKILL')`). When an instance is killed or starting up, `startBalancer()` can hit a connection reset/close or a slow startup/unhandled rejection inside the server process. Also check `.check-logs/instance-1.log` and `.check-logs/instance-2.log` to see the exact crash/error line from your server.
+
+
+
+### Fixes to Apply
+
+#### 1. Keep `seq` strictly increasing when published on the WebSocket (`store.ts`)
+
+In `store.ts`, serialize or order event publishing per workspace (e.g., a simple per-workspace promise chain in memory + ordering by `seq` on `publishWorkspaceEvent` so `seq: N` is published before `seq: N+1` starts publishing). Even better: chain `publishWorkspaceEvent` per `workspaceId` so `incr` + Mongo insert + Redis `publish` happen in strict `seq` order on that instance, and have `attachWebSocket` / client ignore out-of-order frames or flush in `seq` order.
+
+Replace `publishWorkspaceEvent` in `scaffold/server/src/store.ts` with:
+
+```ts
+const publishChains = new Map<string, Promise<unknown>>();
+
+export function publishWorkspaceEvent(
+  workspaceId: string,
+  type: EventDoc['type'],
+  payload: Record<string, unknown>
+): Promise<{ seq: number; frame: Record<string, unknown> }> {
+  const prev = publishChains.get(workspaceId) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      await ensureIndexes();
+      const db = await getDb();
+      const redis = getRedis();
+
+      const seq = await redis.incr(`switchboard:seq:${workspaceId}`);
+      const frame = { seq, type, ...payload };
+
+      await db.collection<EventDoc>('events').insertOne({
+        workspaceId,
+        seq,
+        type,
+        payload,
+      });
+
+      await redis.publish(wsChannel(workspaceId), JSON.stringify(frame));
+      return { seq, frame };
+    });
+
+  publishChains.set(workspaceId, next);
+  return next;
+}
+
+```
+
+#### 2. Prevent unhandled errors from crashing instances & inspect `.check-logs` (`index.ts`)
+
+Add `process.on('unhandledRejection')` and `process.on('uncaughtException')` logging in `scaffold/server/src/index.ts` before `start()`, and ensure Mongo/Redis connections don't drop silently if a connection blips during chaos/crash tests.
+
+```ts
+process.on('unhandledRejection', (err) => {
+  console.error('unhandledRejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+});
+
+```
+
+Also, in `db.ts`, keep a single shared `MongoClient` promise so concurrent `getDb()` calls during startup never race on `client.connect()`:
+
+```ts
+import { MongoClient, type Db } from 'mongodb';
+import { config } from './config.js';
+
+let clientPromise: Promise<MongoClient> | undefined;
+
+export async function getDb(): Promise<Db> {
+  if (!clientPromise) {
+    const client = new MongoClient(config.mongoUrl);
+    clientPromise = client.connect();
+  }
+  const connected = await clientPromise;
+  return connected.db();
+}
+
+```
+
+### Next Steps
+
+1. Check `.check-logs/instance-1.log` right now to see why `GET /__grader/snapshot` returned `502` in Level 2.
+
+
+2. Apply the `db.ts`, `store.ts`, and `index.ts` updates above.
+
+
+3. Re-run `npm run check -- --levels 5` to confirm Level 5 hits **15/15**, then run `npm run check -- --levels 2` and `npm run check -- --levels 3`.
+
+
+
+What's in `.check-logs/instance-1.log`, and how does Level 5 score after the `publishWorkspaceEvent` fix?
+
+here are the logs for you to verify as well
+
+That log makes the cause of the `502` crystal clear: `Error: listen EADDRINUSE: address already in use :::4001` (and `:::4002`).
+
+On Windows/MINGW64, `check.js` spawns `sh -c "npm --prefix scaffold/server start"` with `detached: true` and calls `process.kill(-inst.child.pid, 'SIGKILL')`. Under MSYS2/MINGW64, killing the negative PID doesn't always terminate the grandchild `tsx` / `node` process holding port `4001` or `4002`—so when the next check or restart runs, the old `tsx`/`node` process is still bound to `4001`/`4002`.
+
+### How to Fix It
+
+1. **Kill any lingering Node/tsx processes holding ports 4001–4005** before running the check:
+In Git Bash / MINGW64:
+```bash
+for p in 4001 4002 4003 4004 4005; do
+  pid=$(netstat -ano 2>/dev/null | awk -v port=":$p" '$2 ~ port && $4 == "LISTENING" {print $5; exit}')
+  if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+    taskkill //F //PID "$pid" 2>/dev/null || true
+  fi
+done
+
+```
+
+
+*(Or in PowerShell: `Get-NetTCPConnection -LocalPort 4001,4002 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }`.)*
+2. **Start the built server directly in `switchboard.json` instead of `npm` -> `tsx`:**
+`npm` spawns a wrapper shell and `tsx` spawns a child `node` process, creating an extra process layer on Windows. Building once and running `node` directly makes process teardown much cleaner:
+
+
+```json
+{
+  "install": "npm run scaffold:install && npm --prefix scaffold/server run build",
+  "start": "node scaffold/server/dist/index.js",
+  "health": "/healthz"
+}
+
+```
+
+
+*(Make sure `scaffold/server/package.json` has `"build": "tsc"`—and if you use `tsc`, compile to `dist/` so `node scaffold/server/dist/index.js` runs directly without `npm` or `tsx` in the middle.)*
+3. **Re-run the checks in order:**
+* Clean up lingering port listeners first.
+* Run `npm run check -- --levels 5` (with the `publishWorkspaceEvent` ordering fix in `store.ts` to get the last point on `socket_live`).
+* Run `npm run check -- --levels 2` and `npm run check -- --levels 3`.
+* Finish with `npm run check:full` to generate `CHECK_REPORT.json`.
+
+
+
+
+
+Clean up ports `4001`/`4002` and run Level 2 or Level 5—let me know what score you get next.
+
+Mitul@Mitul_Vic MINGW64 ~/OneDrive/Desktop/GoGHL.ai/starter (main)
+$ npm run check:full 
+npm notice run check:full
+npm notice run node harness/check.js --full
+Switchboard check, profile "full". Your server is started from switchboard.json; logs go to .check-logs/
+
+Level 1: one instance, a bad network
+  PASS  4/4     inbound_complete            175 of 175 genuine messages stored
+  PASS  3/3     inbound_no_duplicates       0 duplicate entries
+  PASS  3/3     inbound_order               0 out-of-order positions (by occurred_at)
+  PASS  2/2     isolation                   0 messages under the wrong workspace or contact, or forged/replayed ids stored
+  PASS  2/2     rejects_forged              0 of 6 forged webhooks accepted
+  PASS  1/1     rejects_stale               0 of 3 replayed webhooks accepted
+  PASS  1/1     ack_speed                   p95 acknowledgement 11 ms, 0 first attempts not acknowledged
+  PASS  2/2     outbound_exactly_once       12 of 12 replies reached the carrier, 0 more than once, 0 requests without Idempotency-Key
+  PASS  1/1     honours_retry_after         0 requests sent inside a Retry-After window
+  PASS  1/1     status_lifecycle            12 of 12 final statuses match the carrier
+  PASS  2/2     claim_atomic                5 of 5 conversations had exactly one winner out of six, 0 had several, 0 had none; snapshot assignee correct for 5
+  PASS  2/2     outage_recovery             6 of 6 replies requested during a 8 s provider outage were delivered afterwards, 0 more than once; 31 requests made during the outage
+
+Level 2: one instance, killed without warning and started again
+  PASS  3/3     crash_inbound_complete      killed at 10 s, down 4 s: 168 of 168 genuine messages stored
+  PASS  2/2     crash_inbound_no_dupes      0 duplicate entries
+  PASS  2/2     crash_inbound_order         0 out-of-order positions
+  PASS  4/4     crash_sends_delivered       12 of 12 replies your server accepted (202) before it was killed reached the carrier after the restart
+  PASS  2/2     crash_sends_once            0 delivered more than once
+  PART  0.92/1  crash_sends_status          11 of 12 final statuses match the carrier
+
+Level 3: 2 instances behind a load balancer
+  PASS  2/2     multi_inbound_complete      182 of 182 genuine messages stored
+  PASS  2/2     multi_inbound_no_dupes      0 duplicate entries
+  PASS  2/2     multi_inbound_order         0 out-of-order positions
+  PASS  3/3     multi_claim                 5 of 5 conversations had exactly one winner out of six, 0 had several, 0 had none; snapshot assignee correct for 5
+  PASS  3/3     multi_sends_once            24 of 24 replies reached the carrier, 0 more than once
+  FAIL  0/3     multi_retry_after           13 requests sent inside a Retry-After window (the limit is per workspace, not per instance)
+  PASS  5/5     failover_delivered          12 of 12 accepted replies reached the carrier within 60 s of one instance dying for good, 0 more than once
+  PART  1.83/2  failover_status             11 of 12 final statuses match the carrier
+
+Level 5: login, tenant isolation and real time, 2 instances
+  PASS  3/3     login                       signed in as u_ben through the IdP; GET /api/me is correct
+  PASS  1/1     me_needs_session            GET /api/me without a session: 401 (want 401)
+  PASS  3/3     api_tenant_isolation        GET /api/conversations as u_ben: own workspace 200 (want 200), another workspace 403 (want 403), no session 401 (want 401)
+  PASS  2/2     socket_refuses_strangers    WebSocket /ws without a session: refused; as u_ben for ws_globex: refused
+  PART  2/3     socket_live                 6 of 6 new messages arrived on the socket within 5 s; 0 frames from another workspace; seq NOT increasing
+  PASS  3/3     socket_replay               4 of 4 messages that arrived while disconnected were replayed after reconnecting with after=6; 0 frames at or before that seq were sent again
+
+Score 70.8 of 75   level 1: 24/24   level 2: 13.9/14   level 3: 18.8/22   level 5: 14/15
+Written to CHECK_REPORT.json. Commit it.
+The trickle of customer messages is off after a check. Turn it back on with: npm run drizzle
+
+okk so this is the report after the changes
+
